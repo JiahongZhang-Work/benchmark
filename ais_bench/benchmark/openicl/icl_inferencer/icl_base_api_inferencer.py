@@ -13,7 +13,7 @@ from abc import abstractmethod
 from collections import defaultdict
 import multiprocessing as mp
 from multiprocessing import BoundedSemaphore, Queue, shared_memory, Value
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 import janus
@@ -62,6 +62,9 @@ class BaseApiInferencer(BaseInferencer):
         pressure_time: Optional[int] = 15,
         output_json_filepath: Optional[str] = "./icl_inference_output",
         save_every: Optional[int] = 1,
+        session_aware: Optional[bool] = False,
+        session_concurrency: Optional[int] = None,
+        pass_agent_hint: Optional[bool] = False,
         **kwargs,
     ) -> None:
         # Base class handles batch_size validation, model construction, output_handler initialization, etc.
@@ -81,6 +84,24 @@ class BaseApiInferencer(BaseInferencer):
         self._data_cache = []  # Thread-local cache for batch data
         self.total_data_count = 0
         self.use_timestamp = False
+        # ===== session-aware concurrency control =====
+        # When session_aware=True, in-flight concurrency is governed by
+        # session_concurrency (max parallel sessions) instead of batch_size.
+        # Within a session, requests are strictly sequential (at-most-1
+        # in-flight). batch_size falls back to janus queue capacity only.
+        self.session_aware = bool(session_aware)
+        self.session_concurrency = int(session_concurrency) if session_concurrency else int(batch_size)
+        if self.session_aware and self.session_concurrency <= 0:
+            raise ParameterValueError(
+                ICLI_CODES.CONCURRENCY_ERROR,
+                f"session_concurrency must be > 0 when session_aware=True, got {self.session_concurrency}",
+            )
+        # pass_agent_hint: when True, the per-sample 'agent_hint' dict is
+        # forwarded into the vLLM request body (merged via get_request_body).
+        # When False (default), agent_hint is used only internally (for
+        # session_id / stage extraction) and dropped before the request is
+        # sent, so it never reaches the API endpoint.
+        self.pass_agent_hint = bool(pass_agent_hint)
 
     def set_config(self, config: ApiInferencerConfig):
         for key, value in config.to_dict().items():
@@ -522,6 +543,175 @@ class BaseApiInferencer(BaseInferencer):
             self.logger.debug(f"Close aiohttp session")
             await session.close()
 
+    async def _session_aware_worker_loop(
+        self,
+        token_bucket: BoundedSemaphore,
+        async_queue: "janus.Queue.async_q",
+    ) -> None:
+        """Session-aware worker loop using the original full-read load pipeline.
+
+        Data loading is identical to the request-level path: the whole dataset
+        is dumped to shared memory and drained through the producer/janus
+        pipeline (no prefetch bound). This loop only groups consumption by
+        session:
+
+          - A single dispatcher coroutine reads data from janus.async_q in
+            FIFO order, routing each item to the per-session queue keyed by
+            data["session_id"], creating a session_worker on first sight.
+          - Each session_worker acquires a shared session_sem (limit =
+            session_concurrency) so at most session_concurrency sessions are
+            executing at any moment; within a session, requests are awaited
+            strictly serially (at-most-1 in-flight) in dataset order.
+          - A session is considered finished as soon as it has consumed its
+            final request carrying stage=end, freeing its exec slot for another
+            session immediately (it does not wait for the queue to drain or for
+            a global sentinel). Sessions without an end marker finish when they
+            drain the queue at end of all data.
+
+        The dataset MUST be pre-sorted by (session_id, in-session order) so
+        same-session items arrive at the dispatcher in order. We do NOT
+        re-sort here.
+
+        Args:
+            token_bucket: Global RPS limiter (None disables). Acquired before
+                each do_request, shared across all sessions.
+            async_queue: janus async side, fed by _producer_thread.
+        """
+        num_workers = self.session_concurrency
+        session_sem = asyncio.Semaphore(num_workers)
+
+        connector = aiohttp.TCPConnector(limit=num_workers + 1)
+        timeout = aiohttp.ClientTimeout(total=get_request_time_out())
+        session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            max_line_size=get_max_chunk_size(),
+            trust_env=True,
+        )
+        self.logger.info(
+            f"[session-aware] create aiohttp session: connector_limit={num_workers + 1}, "
+            f"session_concurrency={num_workers}"
+        )
+
+        stop_event = asyncio.Event()
+        session_queues: Dict[str, "asyncio.Queue"] = {}
+        session_order: List[str] = []      # first-seen order for graceful shutdown
+        session_tasks: List[asyncio.Task] = []
+
+        async def session_worker(sid: str, q: "asyncio.Queue") -> None:
+            """Process all requests of one session sequentially.
+
+            A session completes as soon as it has consumed its stage=end request
+            (end marker), freeing its exec/slot immediately so a waiting session
+            can be admitted -- it does NOT wait for the global None sentinel.
+            Sessions without an end marker only finish when they drain the queue
+            (they receive the None sentinel at end of all data).
+            """
+            saw_end = False
+            async with session_sem:
+                self.logger.info(f"[session-aware] session {sid} acquired exec slot")
+                while not stop_event.is_set():
+                    data = await q.get()
+                    if data is None:  # sentinel from dispatcher (only at end of all data)
+                        break
+                    # Optional global RPS limiter (shared across sessions)
+                    if token_bucket is not None:
+                        acquired = await asyncio.to_thread(token_bucket.acquire, timeout=1)
+                        while not acquired:
+                            if stop_event.is_set():
+                                return
+                            acquired = await asyncio.to_thread(token_bucket.acquire, timeout=1)
+                    try:
+                        self.logger.info(
+                            f"[session-aware] session {sid} START request "
+                            f"stage={data.get('stage', '?')} data_id={data.get('index', '?')} "
+                            f"(queue_left={q.qsize()})"
+                        )
+                        await self.do_request(data, token_bucket, session)
+                        self.logger.info(
+                            f"[session-aware] session {sid} END   request "
+                            f"stage={data.get('stage', '?')} data_id={data.get('index', '?')}"
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        self.logger.info(f"[session-aware] session {sid} request failed: {e}")
+                    stage = data.get("stage")
+                    if isinstance(stage, str) and stage.lower() == "end":
+                        saw_end = True
+                        # end marker consumed -> this session is done, stop
+                        # waiting for more items and free the slot now.
+                        self.logger.info(
+                            f"[session-aware] session {sid} reached stage=end, ending"
+                        )
+                        break
+
+                # Finished when saw stage=end (ends immediately), OR drained the
+                # queue without an end marker (None sentinel / worker shutdown).
+                if not saw_end:
+                    self.logger.warning(
+                        f"[session-aware] session {sid} drained without an 'end' stage marker; "
+                        "releasing its slot anyway. Check dataset start/end marking."
+                    )
+                else:
+                    self.logger.info(f"[session-aware] session {sid} releasing slot")
+
+        def admit_new_session(sid: str, first_data: dict) -> None:
+            q = asyncio.Queue()
+            session_queues[sid] = q
+            session_order.append(sid)
+            t = asyncio.create_task(session_worker(sid, q))
+            session_tasks.append(t)
+            self.logger.info(
+                f"[session-aware] admit NEW session {sid} "
+                f"(data_id={first_data.get('index', '?')})"
+            )
+
+        try:
+            # Dispatcher: reuse the original full-read load pipeline (all data
+            # is in shared memory and drained through janus). Simply read every
+            # item and route it by session_id, creating a per-session queue (and
+            # a session_worker) the first time a session is seen.
+            #
+            # Concurrency is governed entirely by session_sem
+            # (session_concurrency) + the stage lifecycle: within a session the
+            # worker is strictly serial (at-most-1 in-flight); a session ends as
+            # soon as it consumes its stage=end request. There is no prefetch
+            # bound — the full dataset is loaded exactly like the request-level
+            # path, only consumption is grouped by session.
+            while not stop_event.is_set():
+                data = await self.wait_get_data(async_queue, stop_event)
+                if data is None:
+                    break
+                sid = data.get("session_id", "") or "default"
+
+                if sid not in session_queues:
+                    admit_new_session(sid, data)
+                await session_queues[sid].put(data)
+
+            # Input fully drained: push the None sentinel into every per-session
+            # queue so workers (especially sessions without an end marker) drain
+            # and exit, then wait for all of them.
+            for sid in list(session_queues.keys()):
+                session_queues[sid].put_nowait(None)
+
+            if session_tasks:
+                await asyncio.gather(*session_tasks, return_exceptions=False)
+        except asyncio.CancelledError:
+            self.logger.debug(f"[session-aware] cancelled, stopping")
+            stop_event.set()
+            for t in session_tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*session_tasks, return_exceptions=True)
+        except Exception as e:
+            self.logger.warning(f"[session-aware] worker loop error: {e}")
+            stop_event.set()
+            raise
+        finally:
+            self.logger.debug(f"[session-aware] close aiohttp session")
+            await session.close()
+
     def inference_with_shm(
         self,
         dataset_shm_name: str,
@@ -607,9 +797,18 @@ class BaseApiInferencer(BaseInferencer):
             concurrent.futures.ThreadPoolExecutor(max_workers=self.batch_size)
         )
         asyncio.set_event_loop(loop)
-        worker_task = loop.create_task(
-            self._worker_loop(token_bucket, janus_queue.async_q)
-        )
+        if self.session_aware:
+            self.logger.info(
+                f"[session-aware] mode enabled, session_concurrency={self.session_concurrency}, "
+                f"batch_size(janus capacity)={self.batch_size}"
+            )
+            worker_task = loop.create_task(
+                self._session_aware_worker_loop(token_bucket, janus_queue.async_q)
+            )
+        else:
+            worker_task = loop.create_task(
+                self._worker_loop(token_bucket, janus_queue.async_q)
+            )
         # Run consumers on the created loop
         try:
             loop.run_until_complete(worker_task)

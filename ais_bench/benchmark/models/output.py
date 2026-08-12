@@ -26,6 +26,9 @@ class Output:
         # In multi-turn dialogue scenarios, all turns of the same sample share the same uuid.
         # In pass@k scenarios, the same sample is sampled k times and each run receives a distinct uuid
         self.turn_id: int = 0
+        # Session identifier for session-aware concurrency mode. Empty in non-session mode.
+        # Set by GenInferencer.do_request from data["session_id"].
+        self.session_id: str = ""
 
     @abstractmethod
     def get_metrics(self) -> dict:

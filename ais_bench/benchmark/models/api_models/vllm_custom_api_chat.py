@@ -179,6 +179,9 @@ class VLLMCustomAPIChat(BaseAPIModel):
         if self.stream:
             request_body["stream_options"] = {"include_usage": True}
         request_body = request_body | generation_kwargs
+        # Merge per-sample extra fields (e.g. agent_hint) into the body.
+        # session_id is consumed by concurrency control and popped upstream.
+        request_body = request_body | args
         return request_body
 
     async def _parse_usage(self, json_content: dict, output: Output):

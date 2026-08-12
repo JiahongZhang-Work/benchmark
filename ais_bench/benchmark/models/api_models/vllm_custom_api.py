@@ -13,7 +13,11 @@ PromptType = Union[PromptList, str]
 
 @MODELS.register_module()
 class VLLMCustomAPI(BaseAPIModel):
-    """Model wrapper around OpenAI's models. vllm 0.6 +
+    """Model wrapper around OpenAI-compatible APIs (vLLM 0.6+).
+
+    By default sends to ``v1/completions`` (plain-text completion). Set
+    ``use_chat_api=True`` to send to ``v1/chat/completions`` with a
+    ``messages``-style body instead.
 
     Args:
         path (str, optional): Model path or identifier for the specific API model. Defaults to empty string.
@@ -30,6 +34,8 @@ class VLLMCustomAPI(BaseAPIModel):
         meta_template (Dict, optional): Meta template configuration for the model, used to define conversation format and roles. Defaults to None.
         enable_ssl (bool, optional): Whether to enable SSL connection. Defaults to False.
         verbose (bool, optional): Whether to enable verbose logging output. Defaults to False.
+        use_chat_api (bool, optional): When True, send to ``v1/chat/completions``
+            with a messages-format body. Defaults to False.
     """
 
     is_api: bool = True
@@ -50,6 +56,7 @@ class VLLMCustomAPI(BaseAPIModel):
         meta_template: Optional[Dict] = None,
         enable_ssl: bool = False,
         verbose: bool = False,
+        use_chat_api: bool = False,
     ):
         super().__init__(
             path=path,
@@ -65,6 +72,7 @@ class VLLMCustomAPI(BaseAPIModel):
             enable_ssl=enable_ssl,
             verbose=verbose,
         )
+        self.use_chat_api = use_chat_api
         if api_key:
             self.headers["Authorization"] = f"Bearer {api_key}"
             self.logger.info(f"API key is set")
@@ -76,7 +84,7 @@ class VLLMCustomAPI(BaseAPIModel):
         self.lora_data_map = self._load_lora_data_map(generation_kwargs)
 
     def _get_url(self) -> str:
-        endpoint = "v1/completions"
+        endpoint = "v1/chat/completions" if self.use_chat_api else "v1/completions"
         url = urllib.parse.urljoin(self.base_url, endpoint)
         self.logger.debug(f"Request url: {url}")
         return url
@@ -128,13 +136,34 @@ class VLLMCustomAPI(BaseAPIModel):
             f"lora_model_name={lora_model_name} "
             f"model_in_request_body={actual_model_in_body}"
         )
-        request_body = dict(
-            prompt=input_data,
-            stream=self.stream,
-        )
+        if self.use_chat_api:
+            # chat completions: wrap the plain-text prompt into a single user
+            # message so the request hits v1/chat/completions.
+            request_body = dict(
+                messages=[{"role": "user", "content": input_data}],
+                stream=self.stream,
+            )
+        else:
+            request_body = dict(
+                prompt=input_data,
+                stream=self.stream,
+            )
         request_body = request_body | generation_kwargs
+        # Merge per-sample extra fields (e.g. agent_hint) into the body so a
+        # single sample's additional metadata is forwarded to the API. These
+        # arrive via **data from GenInferencer.do_request and **args here.
+        # session_id is consumed by concurrency control and popped upstream.
+        request_body = request_body | args
         if self.stream:
             request_body["stream_options"] = {"include_usage": True}
+        # Debug: confirm per-sample extra fields (e.g. agent_hint) reached the
+        # request body that will be sent to the API.
+        if "agent_hint" in request_body:
+            self.logger.info(
+                f"[agent_hint][send] data_id={getattr(output, 'data_id', None)} "
+                f"session_id={getattr(output, 'session_id', '')} "
+                f"agent_hint={request_body['agent_hint']}"
+            )
         return request_body
 
     async def _parse_usage(self, json_content: dict, output: Output):
@@ -143,7 +172,12 @@ class VLLMCustomAPI(BaseAPIModel):
             output.output_tokens = json_content["usage"].get("completion_tokens", 0)
 
     async def parse_text_response(self, api_response: dict, output: Output):
-        generated_text = api_response.get("choices", [{}])[0].get("text", "")
+        choice = api_response.get("choices", [{}])[0]
+        if self.use_chat_api:
+            # chat completions: text lives in choices[0]["message"]["content"]
+            generated_text = choice.get("message", {}).get("content", "")
+        else:
+            generated_text = choice.get("text", "")
         output.content = generated_text
         await self._parse_usage(api_response, output)
         self.logger.debug(f"Output content: {output.content}")
@@ -151,7 +185,13 @@ class VLLMCustomAPI(BaseAPIModel):
     async def parse_stream_response(self, api_response: dict, output: Output):
         generated_text = ""
         if len(api_response.get("choices", [])) > 0:
-            generated_text = api_response["choices"][0]["text"]
+            choice = api_response["choices"][0]
+            # chat streaming: incremental text lives in delta.content
+            generated_text = (
+                choice.get("delta", {}).get("content", "")
+                if self.use_chat_api
+                else choice.get("text", "")
+            )
         if generated_text:
             output.content += generated_text
         await self._parse_usage(api_response, output)
