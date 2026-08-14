@@ -460,7 +460,9 @@ class BasePerfMetricCalculator(ABC):
 
             self.common_metrics["Total Requests"][stage_name] = self.data_count[stage_name]
             self.common_metrics["Failed Requests"][stage_name] = (
-                self.data_count[stage_name] - self.success_count[stage_name]
+                self.data_count[stage_name]
+                - self.success_count[stage_name]
+                - self.excluded_count[stage_name]
             )
             self.common_metrics["Success Requests"][stage_name] = self.success_count[stage_name]
             self.logger.debug(f"Stage {stage_name} - Request counts: Total={self.common_metrics['Total Requests'][stage_name]}, Success={self.common_metrics['Success Requests'][stage_name]}, Failed={self.common_metrics['Failed Requests'][stage_name]}")

@@ -87,6 +87,9 @@ class GenInferencer(BaseApiInferencer, BaseLocalInferencer):
         # extraction) and NOT transmitted. When pass_agent_hint is True, the
         # full agent_hint dict is kept in **data and merged into the request
         # body by get_request_body.
+        # Capture agent_hint before it is popped so the manage_request flag
+        # can be recorded for performance-statistics exclusion.
+        agent_hint = data.get("agent_hint") or {}
         if not getattr(self, "pass_agent_hint", False):
             data.pop("agent_hint", None)
         uid = str(uuid.uuid4()).replace("-", "")
@@ -94,6 +97,13 @@ class GenInferencer(BaseApiInferencer, BaseLocalInferencer):
         output.uuid = uid
         output.data_id = index
         output.session_id = session_id
+        # Mark requests whose agent_hint.context_management.manage_request is
+        # True so they can be excluded from performance statistics downstream.
+        if isinstance(agent_hint, dict):
+            context_mgmt = agent_hint.get("context_management") or {}
+            output.extra_perf_data["manage_request"] = bool(
+                context_mgmt.get("manage_request")
+            )
         # Debug: confirm agent_hint survives up to the generate() call when
         # pass_agent_hint=True (i.e. it is forwarded via **data).
         if getattr(self, "pass_agent_hint", False):
