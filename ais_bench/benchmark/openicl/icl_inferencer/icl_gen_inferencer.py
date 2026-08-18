@@ -83,6 +83,17 @@ class GenInferencer(BaseApiInferencer, BaseLocalInferencer):
         # stage is a control field for session end-of-life decisions; never
         # forward it to the request body.
         data.pop("stage", None)
+        # ---- 控制面请求检测（必须在 pop agent_hint 之前） ----
+        # manage_request=True 的请求是纯控制面请求（如 evict），服务器端
+        # 不执行推理，只执行 edits。这类请求不应计入性能统计，且在
+        # pass_agent_hint=False 时无任何载荷意义，应直接跳过。
+        is_manage_req = False
+        raw_agent_hint = data.get("agent_hint", {})
+        if isinstance(raw_agent_hint, dict):
+            cm = raw_agent_hint.get("context_management", {})
+            if isinstance(cm, dict) and cm.get("manage_request") is True:
+                is_manage_req = True
+
         # agent_hint: by default used only internally (session_id/stage
         # extraction) and NOT transmitted. When pass_agent_hint is True, the
         # full agent_hint dict is kept in **data and merged into the request
@@ -91,7 +102,17 @@ class GenInferencer(BaseApiInferencer, BaseLocalInferencer):
         # can be recorded for performance-statistics exclusion.
         agent_hint = data.get("agent_hint") or {}
         if not getattr(self, "pass_agent_hint", False):
+            # pass_agent_hint=False：agent_hint 不透传。此时控制面请求
+            #（manage_request=True）发了也没有任何效果——直接跳过，
+            # 不发 HTTP、不计入统计。
+            if is_manage_req:
+                self.logger.info(
+                    f"[session-aware] skip manage_request since pass_agent_hint=False, "
+                    f"session_id={session_id} data_id={index}"
+                )
+                return
             data.pop("agent_hint", None)
+
         uid = str(uuid.uuid4()).replace("-", "")
         output = RequestOutput(self.perf_mode)
         output.uuid = uid
@@ -121,7 +142,8 @@ class GenInferencer(BaseApiInferencer, BaseLocalInferencer):
         await self.status_counter.finish()
         await self.status_counter.case_finish()
 
-        await self.output_handler.report_cache_info(index, input, output, data_abbr, gold)
+        if not is_manage_req:
+            await self.output_handler.report_cache_info(index, input, output, data_abbr, gold)
 
     def batch_inference(
         self,
