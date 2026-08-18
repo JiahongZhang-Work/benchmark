@@ -100,7 +100,6 @@ class GenInferencer(BaseApiInferencer, BaseLocalInferencer):
         # body by get_request_body.
         # Capture agent_hint before it is popped so the manage_request flag
         # can be recorded for performance-statistics exclusion.
-        agent_hint = data.get("agent_hint") or {}
         if not getattr(self, "pass_agent_hint", False):
             # pass_agent_hint=False：agent_hint 不透传。此时控制面请求
             #（manage_request=True）发了也没有任何效果——直接跳过，
@@ -118,13 +117,7 @@ class GenInferencer(BaseApiInferencer, BaseLocalInferencer):
         output.uuid = uid
         output.data_id = index
         output.session_id = session_id
-        # Mark requests whose agent_hint.context_management.manage_request is
-        # True so they can be excluded from performance statistics downstream.
-        if isinstance(agent_hint, dict):
-            context_mgmt = agent_hint.get("context_management") or {}
-            output.extra_perf_data["manage_request"] = bool(
-                context_mgmt.get("manage_request")
-            )
+
         # Debug: confirm agent_hint survives up to the generate() call when
         # pass_agent_hint=True (i.e. it is forwarded via **data).
         if getattr(self, "pass_agent_hint", False):
@@ -133,6 +126,9 @@ class GenInferencer(BaseApiInferencer, BaseLocalInferencer):
                 f"agent_hint_in_data={'agent_hint' in data} "
                 f"agent_hint={data.get('agent_hint')}"
             )
+            # Mark requests whose agent_hint.context_management.manage_request is
+            # True so they can be excluded from performance statistics downstream.
+            output.extra_perf_data["manage_request"] = is_manage_req
         await self.status_counter.post()
         await self.model.generate(input, max_out_len, output, session=session, **data)
         if output.success:
@@ -142,8 +138,9 @@ class GenInferencer(BaseApiInferencer, BaseLocalInferencer):
         await self.status_counter.finish()
         await self.status_counter.case_finish()
 
-        if not is_manage_req:
-            await self.output_handler.report_cache_info(index, input, output, data_abbr, gold)
+        # if not is_manage_req:
+        #     await self.output_handler.report_cache_info(index, input, output, data_abbr, gold)
+        await self.output_handler.report_cache_info(index, input, output, data_abbr, gold)
 
     def batch_inference(
         self,
