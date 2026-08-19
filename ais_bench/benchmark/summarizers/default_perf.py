@@ -144,8 +144,8 @@ class DefaultPerfSummarizer:
 
         for perf_data in perf_datas:
             # Exclude requests marked as manage_request=True from performance
-            # statistics. They count toward Total Requests but not Success /
-            # Failed / performance metrics (tracked via the excluded flag).
+            # statistics. They are excluded from Total / Success / Failed
+            # counts and performance metrics (tracked via the excluded flag).
             if perf_data.get("extra_perf_data", {}).get("manage_request"):
                 manager_list.append({"success": False, "excluded": True})
                 continue

@@ -75,10 +75,12 @@ class DefaultPerfMetricCalculator(BasePerfMetricCalculator):
         for k, v in full_result.items():
             if v is not None:
                 result[k] = [v[i] for i in id_list]
-        self.data_count[stage_name] = len(full_result["success"])
+        # Excluded requests (manage_request=True) must NOT be counted in the
+        # total request number, so subtract them from data_count.
+        self.excluded_count[stage_name] = sum(full_result.get("excluded", []))
+        self.data_count[stage_name] = len(full_result["success"]) - self.excluded_count[stage_name]
         self.decode_latencies[stage_name] = result["itl"]
         self.success_count[stage_name] = sum(full_result["success"])
-        self.excluded_count[stage_name] = sum(full_result.get("excluded", []))
         self.infer_time[stage_name] = max(result["end_time"]) - min(
             result["start_time"]
         )

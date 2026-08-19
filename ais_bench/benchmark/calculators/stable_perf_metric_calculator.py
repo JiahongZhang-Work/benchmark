@@ -201,6 +201,8 @@ class StablePerfMetricCalculator(BasePerfMetricCalculator):
         # Excluded (manage_request) requests have no start/end time entries, so
         # they never appear in the stable stage window -> excluded_count is 0.
         self.excluded_count[stage_name] = 0
+        # data_count already excludes excluded (manage_request) requests.
+        self.data_count[stage_name] -= self.excluded_count[stage_name]
         self.infer_time[stage_name] = self.stage_section[1] - self.stage_section[0]
         self.logger.info("Converting performance results for stage...")
         self.result[stage_name] = self.convert_result(result)
