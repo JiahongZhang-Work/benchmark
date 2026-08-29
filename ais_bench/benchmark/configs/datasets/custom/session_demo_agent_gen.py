@@ -34,7 +34,7 @@ agent_demo_datasets = [
     dict(
         abbr='session-agent-demo',
         type=CustomDataset,
-        path='ais_bench/datasets/session_demo/session_demo_agent.jsonl',
+        path='ais_bench/datasets/session_demo/session_single_turn.jsonl',
         reader_cfg=agent_demo_reader_cfg,
         infer_cfg=agent_demo_infer_cfg,
         eval_cfg=agent_demo_eval_cfg,
