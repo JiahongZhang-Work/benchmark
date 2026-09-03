@@ -559,6 +559,10 @@ class BaseApiInferencer(BaseInferencer):
                 return True
         return False
 
+    @staticmethod
+    def _task_queue_has_real_data(q: "asyncio.Queue"):
+        return q.qsize() > 1  # 1 means the last data(None) of each queue.
+
     async def _session_aware_worker_loop(
         self,
         token_bucket: BoundedSemaphore,
@@ -619,8 +623,31 @@ class BaseApiInferencer(BaseInferencer):
 
         stop_event = asyncio.Event()
         session_queues: Dict[str, "asyncio.Queue"] = {}
-        session_order: List[str] = []      # first-seen order for graceful shutdown
         session_tasks: List[asyncio.Task] = []
+
+        def create_new_task(q: "asyncio.Queue") -> None:
+            # Drain whatever is already queued (FIFO order preserves
+            # dataset order) so it can be re-queued for the new task.
+            remaining = []
+            while True:
+                try:
+                    item = q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                remaining.append(item)
+            new_q: "asyncio.Queue" = asyncio.Queue()
+            # Re-point this session so the dispatcher routes all
+            # later arrivals to the new task.
+            session_queues[sid] = new_q
+            for item in remaining:
+                new_q.put_nowait(item)
+            active_q = new_q
+            self.logger.info(
+                f"[session-aware] session {sid} OFFLOAD detected, "
+                f"handing over {len(remaining)} queued item(s) to a new task"
+            )
+            t = asyncio.create_task(session_worker(sid, active_q))
+            session_tasks.append(t)
 
         async def session_worker(sid: str, q: "asyncio.Queue") -> None:
             """Process one span of a session sequentially.
@@ -640,7 +667,7 @@ class BaseApiInferencer(BaseInferencer):
             appended to ``session_tasks``) to process the remaining data.
             """
             saw_end = False
-            split = False
+            split = False  # whether create a new task (and a new queue) for the remain datas of current queue.
             async with session_sem:
                 self.logger.info(f"[session-aware] session {sid} acquired exec slot, work queue len is {q.qsize()}")
                 while not stop_event.is_set():
@@ -649,28 +676,9 @@ class BaseApiInferencer(BaseInferencer):
                         break
 
                     # Offload split: hand the rest of this session to a new task.
-                    if self._data_has_offload_edit(data) and q.qsize() > 1:
+                    if self._task_queue_has_real_data(q) and self._data_has_offload_edit(data):
                         split = True
-                        # Drain whatever is already queued (FIFO order preserves
-                        # dataset order) so it can be re-queued for the new task.
-                        remaining = []
-                        while True:
-                            try:
-                                item = q.get_nowait()
-                            except asyncio.QueueEmpty:
-                                break
-                            remaining.append(item)
-                        new_q: "asyncio.Queue" = asyncio.Queue()
-                        # Re-point this session so the dispatcher routes all
-                        # later arrivals to the new task.
-                        session_queues[sid] = new_q
-                        for item in remaining:
-                            new_q.put_nowait(item)
-                        active_q = new_q
-                        self.logger.info(
-                            f"[session-aware] session {sid} OFFLOAD detected, "
-                            f"handing over {len(remaining)} queued item(s) to a new task"
-                        )
+                        create_new_task(q)
 
                     # Optional global RPS limiter (shared across sessions)
                     if token_bucket is not None:
@@ -683,7 +691,6 @@ class BaseApiInferencer(BaseInferencer):
                         self.logger.info(
                             f"[session-aware] session {sid} START request "
                             f"stage={data.get('stage', '?')} data_id={data.get('index', '?')} "
-                            f"(offload_split={split})"
                         )
                         await self.do_request(data, token_bucket, session)
                         self.logger.info(
@@ -702,8 +709,6 @@ class BaseApiInferencer(BaseInferencer):
                             f"[session-aware] session {sid} interrupted after offload, "
                             f"submitting new task for remaining data"
                         )
-                        t = asyncio.create_task(session_worker(sid, active_q))
-                        session_tasks.append(t)
                         break
 
                     stage = data.get("stage")
@@ -769,19 +774,16 @@ class BaseApiInferencer(BaseInferencer):
                 if data is None:
                     break
                 sid = data.get("session_id", "") or "default"
-
                 if sid not in session_queues:
                     q = asyncio.Queue()
                     session_queues[sid] = q
-                    if sid not in session_order:
-                        session_order.append(sid)
-
                 await session_queues[sid].put(data)
 
             # create & launch task per session after total data filled in queue.
             for sid in list(session_queues.keys()):
                 session_queues[sid].put_nowait(None)
-                # 需要把task的q填充完成后，再启动创建task，因为task中会检查session暂停（offload操作），然后把后续请求封装为一个新的task，因此需要完整的q
+                # Tasks must be created after the queue is fully populated: each task checks session pause (offload)
+                # and wraps follow-up requests into a new task, requiring a complete queue.
                 t = asyncio.create_task(session_worker(sid, session_queues[sid]))
                 session_tasks.append(t)
                 self.logger.info(
