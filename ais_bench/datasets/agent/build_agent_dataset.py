@@ -11,17 +11,37 @@ Usage:
 Each dataset type has its own processor registered in DATASET_PROCESSORS.
 To add a new type, implement a processor function and register it via @register("name").
 
+  ┌─────────────┬────────────────────┬────────────────────────────────────┐
+  │    简写     │        全称        │                说明                │
+  ├─────────────┼────────────────────┼────────────────────────────────────┤
+  │ -t          │ --src-dataset-type │ 数据集类型                         │
+  ├─────────────┼────────────────────┼────────────────────────────────────┤
+  │ -s          │ --src              │ 源路径                             │
+  ├─────────────┼────────────────────┼────────────────────────────────────┤
+  │ -o          │ --output           │ 输出文件                           │
+  ├─────────────┼────────────────────┼────────────────────────────────────┤
+  │ -c          │ --cut-count        │ session 内尾部截取条数             │
+  ├─────────────┼────────────────────┼────────────────────────────────────┤
+  │ -n          │ --session-count    │ 保留前 N 个 session                │
+  ├─────────────┼────────────────────┼────────────────────────────────────┤
+  │ -p          │ --add-pause        │ 暂停比例                           │
+  ├─────────────┼────────────────────┼────────────────────────────────────┤
+  │ -P          │ --preview          │ 预览模式（大写以区分 -p）          │
+  ├─────────────┼────────────────────┼────────────────────────────────────┤
+  │ --tokenizer │ 无简写             │ 保留全称（使用频率低，避免占字母） │
+  └─────────────┴────────────────────┴────────────────────────────────────┘
+
 使用实例：
 # Jiuwen数据集
-# 1、按照原始的sid、request_id排序 
+# 1、按照原始的sid、request_id排序
 python ./build_agent_dataset.py --src-dataset-type Jiuwen --src ./c20_on_model_io/model_io
 # 2、按照原始的sid、request_id排序，每个session中截取尾部cut-count条数据
 python ./build_agent_dataset.py --src-dataset-type Jiuwen --src ./c20_on_model_io/model_io --cut-count 5
-# 3、截取前--session-count个session 
+# 3、截取前--session-count个session
 python ./build_agent_dataset.py --src-dataset-type Jiuwen --src ./c20_on_model_io/model_io --cut-count 5 --session-count 3
-# 4、指定添加随机暂停 --add-pause 0.5 表示总session中有0.5比例的其中随机添加一组offload+prefetch 
+# 4、指定添加随机暂停 --add-pause 0.5 表示总session中有0.5比例的其中随机添加一组offload+prefetch
 python ./build_agent_dataset.py --src-dataset-type Jiuwen --src ./c20_on_model_io/model_io --cut-count 4 --session-count 3 --add-pause 0.5
-# 5、预览 --preview，把question字段置位11，可以快速浏览生成情况 
+# 5、预览 --preview，把question字段置位11，可以快速浏览生成情况
 python ./build_agent_dataset.py --src-dataset-type Jiuwen --src ./c20_on_model_io/model_io --cut-count 4 --session-count 3 --add-pause 0.5 --preview
 # 6、default类型
 python build_agent_dataset.py --src agent_dataset_pure.jsonl --output agent_dataset_pure2.jsonl --tokenizer D:/data/qwen3-06b/tokenizer.json --add-pause 0.5
@@ -216,9 +236,6 @@ def process_jiuwen(args: argparse.Namespace) -> None:
         _, request_idx, _ = parse_file_name(os.path.basename(filepath))
         agent_hint["stage"] = "start" if request_idx == 1 else f"stage-{request_idx-1}"
 
-        # --preview 时用占位文本，否则取实际请求内容
-        msg = "11" if args.preview else msg
-
         return {
             "question": msg,
             "answer": "",
@@ -303,9 +320,154 @@ def process_jiuwen(args: argparse.Namespace) -> None:
                     big_out.append(offload_data)
                     big_out.append(prefetch_data)
 
-            # 4. 整个大组的 session_id 赋值为 parent_session_id
-            for rec in big_out:
-                rec["agent_hint"]["session_id"] = psid
+            out.extend(big_out)
+        return out
+
+    def group_by_parent_sessions_evict(dataset):
+        """Like ``group_by_parent_sessions`` but distinguishes 中断小组 and
+        未中断小组 within each 大组 (parent_session_id).
+
+        Steps:
+        1. 大组 by ``parent_session_id`` (first-seen order); 大组内保持
+           原始数据顺序。
+        2. 大组内按 ``session_id`` 的相邻性切分小组（一段连续且相同
+           session_id 的记录为一个小组）。
+        3. 对每个 session_id 的多个小组两两成对：在前一个小组末尾追加
+           offload，在后一个同 sid 小组最前边插入 prefetch（非相邻配对，
+           中间可以穿插其他 session_id 的小组）。
+           - 大组内某 session_id 的最后一个小组若是大组最后一个小组 ->
+             仅追加 evict；若是未中断小组但非大组最后一个小组 ->
+             追加 evict + end。
+        4. 大组内所有记录的 ``session_id`` 赋值为大组的
+           ``parent_session_id``。返回新列表。
+        """
+        # 1. 大组 by parent_session_id (first-seen order)
+        big_groups: dict[str, list[dict]] = {}
+        big_order: list[str] = []
+        for rec in dataset:
+            psid = (rec.get("agent_hint") or {}).get("parent_session_id", "")
+            if psid not in big_groups:
+                big_groups[psid] = []
+                big_order.append(psid)
+            big_groups[psid].append(rec)
+
+        out: list[dict] = []
+        for psid in big_order:
+            recs = big_groups[psid]
+
+            # 2. 切分小组：maximal adjacent runs of same session_id
+            sub_runs: list[tuple[str, list[dict]]] = []
+            for rec in recs:
+                sid = (rec.get("agent_hint") or {}).get("session_id", "")
+                if sub_runs and sub_runs[-1][0] == sid:
+                    sub_runs[-1][1].append(rec)
+                else:
+                    sub_runs.append((sid, [rec]))
+
+            # 3. 统计每个 session_id 在大组内的小组数量
+            sid_run_count: dict[str, int] = {}
+            for sid, _ in sub_runs:
+                sid_run_count[sid] = sid_run_count.get(sid, 0) + 1
+
+            big_out: list[dict] = []
+            run_pos: dict[str, int] = {}
+            total_runs = len(sub_runs)
+            for run_idx, (sid, run) in enumerate(sub_runs):
+                run_pos[sid] = run_pos.get(sid, 0) + 1
+                is_first_run_of_sid = run_pos[sid] == 1
+                is_last_run_of_sid = run_pos[sid] == sid_run_count[sid]
+                is_last_run_in_big = run_idx == total_runs - 1
+
+                # 非首段同 sid 小组：在小组最前边补一个 prefetch（与上一段末尾的 offload 配对）
+                if not is_first_run_of_sid:
+                    prefetch_data = {
+                        "question": "",
+                        "answer": "",
+                        "agent_hint": {
+                            "session_id": sid,
+                            "parent_session_id": psid,
+                            "cache_control": {},
+                            "context_management": {
+                                "manage_request": True,
+                                "edits": [{"type": "prefetch", "target": "session"}],
+                            },
+                            "stage": "",
+                        },
+                    }
+                    print(f'>>>>>>>>>>>>>>>>> prefetch  (psid={psid}, sid={sid})')
+                    big_out.append(prefetch_data)
+
+                big_out.extend(run)
+
+                if not is_last_run_of_sid:
+                    # 中断小组：末尾追加 offload（prefetch 留到下一段同 sid 小组开头）
+                    offload_data = {
+                        "question": "",
+                        "answer": "",
+                        "agent_hint": {
+                            "session_id": sid,
+                            "parent_session_id": psid,
+                            "cache_control": {},
+                            "context_management": {
+                                "manage_request": True,
+                                "edits": [{"type": "offload", "target": "session"}],
+                            },
+                            "stage": "",
+                        },
+                    }
+                    print(f'>>>>>>>>>>>>>>>>> offload  (psid={psid}, sid={sid})')
+                    big_out.append(offload_data)
+                elif is_last_run_in_big:
+                    # 大组最后一个小组：仅追加 evict
+                    evict_data = {
+                        "question": "",
+                        "answer": "",
+                        "agent_hint": {
+                            "session_id": sid,
+                            "parent_session_id": psid,
+                            "cache_control": {},
+                            "context_management": {
+                                "manage_request": True,
+                                "edits": [{"type": "evict", "target": "session"}],
+                            },
+                            "stage": "",
+                        },
+                    }
+                    print(f'>>>>>>>>>>>>>>>>> evict  (psid={psid}, sid={sid})')
+                    big_out.append(evict_data)
+                else:
+                    # 未中断小组：evict + end
+                    evict_data = {
+                        "question": "",
+                        "answer": "",
+                        "agent_hint": {
+                            "session_id": sid,
+                            "parent_session_id": psid,
+                            "cache_control": {},
+                            "context_management": {
+                                "manage_request": True,
+                                "edits": [{"type": "evict", "target": "session"}],
+                            },
+                            "stage": "",
+                        },
+                    }
+                    end_data = {
+                        "question": "",
+                        "answer": "",
+                        "agent_hint": {
+                            "session_id": sid,
+                            "parent_session_id": psid,
+                            "cache_control": {},
+                            "context_management": {
+                                "manage_request": False,
+                                "edits": [],
+                            },
+                            "stage": "end",
+                        },
+                    }
+                    print(f'>>>>>>>>>>>>>>>>> evict + end  (psid={psid}, sid={sid})')
+                    big_out.append(evict_data)
+                    big_out.append(end_data)
 
             out.extend(big_out)
         return out
@@ -355,8 +517,42 @@ def process_jiuwen(args: argparse.Namespace) -> None:
             ah = rec.get("agent_hint") or {}
             cm = ah.get("context_management", {})
             return cm.get("manage_request", False)
-    
+
         return [rec for rec in dataset if not _is_manage_request(rec)]
+
+    def filter_token_len(dataset, max_token_len):
+        """Drop records whose ``question`` token count exceeds ``max_token_len``.
+
+        Requires a tokenizer (loaded from --tokenizer). Records with an empty
+        question (e.g. management requests) are kept. Returns a new list.
+        """
+        if tokenizer is None:
+            raise ValueError("filter_token_len requires --tokenizer to be set")
+        kept = []
+        dropped = 0
+        for rec in dataset:
+            q = rec.get("question", "") or ""
+            if q == "":
+                kept.append(rec)
+                continue
+            n = len(tokenizer.encode(q).ids)
+            if n > max_token_len:
+                dropped += 1
+                continue
+            kept.append(rec)
+        print(f'===== filter_token_len: dropped {dropped} records with token_len > {max_token_len}')
+        return kept
+
+    def process_preview(dataset):
+        """Replace each record's ``question`` with placeholder "11" in preview
+        mode. No-op when --preview is not set. Returns the same list (in-place).
+        """
+        if not args.preview:
+            return dataset
+        for rec in dataset:
+            if rec.get("question"):
+                rec["question"] = "11"
+        return dataset
 
 
     # cut_count：session内部截取数据条数
@@ -394,11 +590,11 @@ def process_jiuwen(args: argparse.Namespace) -> None:
             out.extend(kept)
         return out, order
 
-    # session_count：截取session数量
+    # session_count：截取大组数量（按parent_session_id）
     def cut_session_outer(dataset, session_count):
-        """Keep only the first ``session_count`` sessions (grouped by
-        session_id in first-seen order). ``session_count`` is clamped to the
-        actual number of sessions; None keeps all. Returns (new_list, order).
+        """Keep only the first ``session_count`` 大组 (grouped by
+        parent_session_id in first-seen order). ``session_count`` is clamped
+        to the actual number of 大组; None keeps all. Returns (new_list, order).
         """
         if session_count is not None and session_count < 0:
             raise ValueError("session_count must be >= 0")
@@ -406,11 +602,11 @@ def process_jiuwen(args: argparse.Namespace) -> None:
         groups: dict[str, list[dict]] = {}
         order: list[str] = []
         for rec in dataset:
-            sid = rec["agent_hint"].get("session_id", "")
-            if sid not in groups:
-                groups[sid] = []
-                order.append(sid)
-            groups[sid].append(rec)
+            psid = (rec.get("agent_hint") or {}).get("parent_session_id", "")
+            if psid not in groups:
+                groups[psid] = []
+                order.append(psid)
+            groups[psid].append(rec)
 
         if session_count is None:
             kept_order = order
@@ -418,8 +614,8 @@ def process_jiuwen(args: argparse.Namespace) -> None:
             kept_order = order[:min(session_count, len(order))]
 
         out: list[dict] = []
-        for sid in kept_order:
-            out.extend(groups[sid])
+        for psid in kept_order:
+            out.extend(groups[psid])
         return out, kept_order
 
     # def cut_sessions(dataset, cut_count, session_count=None):
@@ -447,25 +643,35 @@ def process_jiuwen(args: argparse.Namespace) -> None:
         print(f'===== {os.path.basename(filepath)}')
         all_records.append(gen_dataset_line(filepath))
 
-    # 删除管理请求 
-    dataset = remove_manage_request(all_records)    
+    # 2. 按max_token_len过滤超长question
+    if getattr(args, "max_token_len", None) is not None:
+        all_records = filter_token_len(all_records, args.max_token_len)
 
-    # 每个session内部截取尾部cut_count条数据
+    # 3. --preview：把question字段替换为占位"11"
+    all_records = process_preview(all_records)
+
+    # 4. 删除自带的管理请求
+    dataset = remove_manage_request(all_records)
+
+    # 5. 每个session内部截取尾部cut_count条数据
     if args.cut_count:
         dataset, _ = cut_session_inner(dataset, args.cut_count)
 
-    # 按parent_session_id分大组，内部按session_id分小组，每小组之间插入offload+prefetch，session_id = parent_session_id  
-    dataset = group_by_parent_sessions(dataset)
+    # 6. 按parent_session_id分大组，内部按session_id分小组插入管理请求
+    # 6.1 --evict：中断小组末尾加 offload、后一段同 sid 小组开头加 prefetch（非相邻配对）；
+    #     未中断小组加 evict+end；大组最后小组仅加 evict。
+    # 6.2 默认：每两个相邻小组之间插入 offload+prefetch，再在每个 session 末尾追加 evict。
+    if getattr(args, "evict", False):
+        dataset = group_by_parent_sessions_evict(dataset)
+    else:
+        dataset = group_by_parent_sessions(dataset)
+        # 每个session末尾追加evict管理请求
+        dataset = add_evict_manage_request(dataset)
 
-    # 每个session末尾追加evict管理请求
-    dataset = add_evict_manage_request(dataset)
-
-    # 保留前session_count个session
+    # 7. 保留前session_count个大组（按parent_session_id分组）
     dataset, order = cut_session_outer(dataset, args.session_count)
 
-    clear_parent_session_id(dataset)
-
-    # 按比例在部分session内部随机插入offload+prefetch暂停对
+    # 8. 按比例在部分session内部随机插入offload+prefetch暂停对
     if args.add_pause is not None:
         dataset = add_pause_in_session(dataset, args.add_pause)
 
@@ -715,6 +921,13 @@ def build_parser() -> argparse.ArgumentParser:
              "the placeholder \"11\". Useful for quick smoke tests without "
              "sending real prompt content.",
     )
+    # Jiuwen-specific: use evict+end for 未中断小组 instead of always offload+prefetch.
+    parser.add_argument(
+        "--evict", action="store_true", default=False,
+        help="(Jiuwen) Use group_by_parent_sessions_evict: within each 大组, "
+             "中断小组 get offload+prefetch, 未中断小组 get evict+end. "
+             "Skips add_evict_manage_request when set.",
+    )
     # default-specific: prefix-cache hit rate threshold for session grouping.
     parser.add_argument(
         "-r", "--hit-rate", type=float, default=0.0,
@@ -722,6 +935,13 @@ def build_parser() -> argparse.ArgumentParser:
              "session when grouping records by prefix cache. A record whose "
              "hit rate against the current session trie is <= this value "
              "starts a new session. Default 0.0 (only 0%% hit breaks).",
+    )
+    # Jiuwen-specific: drop records whose question token count exceeds this.
+    parser.add_argument(
+        "--max-token-len", type=int, default=None,
+        help="(Jiuwen) Drop records whose question field token count exceeds "
+             "this value. Requires --tokenizer. Applied before remove_manage_request. "
+             "Skipped if not set.",
     )
     return parser
 
