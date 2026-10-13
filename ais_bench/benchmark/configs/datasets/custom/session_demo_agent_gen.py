@@ -9,7 +9,7 @@ from ais_bench.benchmark.datasets import CustomDataset
 # session_id 会在 icl_gen_inferencer.get_data_list 里自动从 agent_hint.session_id 提取。
 # agent_hint 本身作为额外字段被透传到 vLLM 请求 body（不进入 prompt 模板）。
 agent_demo_reader_cfg = dict(
-    input_columns=['question'],
+    input_columns=['question', 'max_out_len'],
     output_column=None,
 )
 
