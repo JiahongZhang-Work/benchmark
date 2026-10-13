@@ -219,7 +219,7 @@ def process_jiuwen(args: argparse.Namespace) -> None:
         )
         return (session_idx, request_idx, is_manage)
 
-    def gen_dataset_line(filepath: Path):
+    def gen_dataset_line(filepath: Path, tokenizer=None):
         with open(filepath, "r", encoding="utf-8") as f:
             data = json.load(f)
         request = data.get("request", {})
@@ -236,10 +236,21 @@ def process_jiuwen(args: argparse.Namespace) -> None:
         _, request_idx, _ = parse_file_name(os.path.basename(filepath))
         agent_hint["stage"] = "start" if request_idx == 1 else f"stage-{request_idx-1}"
 
+        # 用 usage 字段计算 max_tokens = total_tokens - prompt_tokens
+        usage = data.get("usage") or {}
+        total_tokens = usage.get("total_tokens", 0) or 0
+        prompt_tokens = usage.get("prompt_tokens", 0) or 0
+        max_tokens = total_tokens - prompt_tokens
+        print(f'----- max_tokens = {max_tokens}')
+
+        if max_tokens == 0:
+            max_tokens = 1
+
         return {
             "question": msg,
             "answer": "",
             "agent_hint": agent_hint,
+            "max_tokens": max_tokens,
         }
 
     def clear_parent_session_id(dataset):
@@ -641,7 +652,7 @@ def process_jiuwen(args: argparse.Namespace) -> None:
     all_records = []
     for filepath in json_files:
         print(f'===== {os.path.basename(filepath)}')
-        all_records.append(gen_dataset_line(filepath))
+        all_records.append(gen_dataset_line(filepath, tokenizer))
 
     # 2. 按max_token_len过滤超长question
     if getattr(args, "max_token_len", None) is not None:
