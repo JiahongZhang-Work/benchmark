@@ -142,6 +142,33 @@ def add_pause_in_session(dataset, percent):
         offload_data = {
             "question": "",
             "answer": "",
+            "messages": [{"content": "", "role": "system"}],
+            "tools": [{
+                "function": {
+                "description": "",
+                "name": "read_pdf",
+                "parameters": {
+                    "additionalProperties": True,
+                    "properties": {
+                    "call_goal": {
+                        "description": "call goal",
+                        "type": "string"
+                    },
+                    "inputs": {
+                        "additionalProperties": {},
+                        "description": "inputs",
+                        "type": "object"
+                    }
+                    },
+                    "required": [
+                    "inputs"
+                    ],
+                    "title": "read pdf",
+                    "type": "object"
+                }
+                },
+                "type": "function"
+            }],
             "agent_hint": {
                 "session_id": sid,
                 "parent_session_id": last_ah.get("parent_session_id", ""),
@@ -156,6 +183,33 @@ def add_pause_in_session(dataset, percent):
         prefetch_data = {
             "question": "",
             "answer": "",
+            "messages": [{"content": "", "role": "system"}],
+            "tools": [{
+                "function": {
+                "description": "",
+                "name": "read_pdf",
+                "parameters": {
+                    "additionalProperties": True,
+                    "properties": {
+                    "call_goal": {
+                        "description": "call goal",
+                        "type": "string"
+                    },
+                    "inputs": {
+                        "additionalProperties": {},
+                        "description": "inputs",
+                        "type": "object"
+                    }
+                    },
+                    "required": [
+                    "inputs"
+                    ],
+                    "title": "read pdf",
+                    "type": "object"
+                }
+                },
+                "type": "function"
+            }],
             "agent_hint": {
                 "session_id": sid,
                 "parent_session_id": last_ah.get("parent_session_id", ""),
@@ -247,7 +301,7 @@ def process_jiuwen(args: argparse.Namespace) -> None:
         print(f'----- max_tokens = {max_tokens}')
 
         if max_tokens == 0:
-            max_tokens = 1 
+            max_tokens = 1
 
         return {
             "question": "",
@@ -308,6 +362,33 @@ def process_jiuwen(args: argparse.Namespace) -> None:
                     offload_data = {
                         "question": "",
                         "answer": "",
+                        "messages": [{"content": "", "role": "system"}],
+                        "tools": [{
+                            "function": {
+                            "description": "",
+                            "name": "read_pdf",
+                            "parameters": {
+                                "additionalProperties": True,
+                                "properties": {
+                                "call_goal": {
+                                    "description": "call goal",
+                                    "type": "string"
+                                },
+                                "inputs": {
+                                    "additionalProperties": {},
+                                    "description": "inputs",
+                                    "type": "object"
+                                }
+                                },
+                                "required": [
+                                "inputs"
+                                ],
+                                "title": "read pdf",
+                                "type": "object"
+                            }
+                            },
+                            "type": "function"
+                        }],
                         "agent_hint": {
                             "session_id": sid,
                             "parent_session_id": psid,
@@ -322,6 +403,33 @@ def process_jiuwen(args: argparse.Namespace) -> None:
                     prefetch_data = {
                         "question": "",
                         "answer": "",
+                        "messages": [{"content": "", "role": "system"}],
+                        "tools": [{
+                            "function": {
+                            "description": "",
+                            "name": "read_pdf",
+                            "parameters": {
+                                "additionalProperties": True,
+                                "properties": {
+                                "call_goal": {
+                                    "description": "call goal",
+                                    "type": "string"
+                                },
+                                "inputs": {
+                                    "additionalProperties": {},
+                                    "description": "inputs",
+                                    "type": "object"
+                                }
+                                },
+                                "required": [
+                                "inputs"
+                                ],
+                                "title": "read pdf",
+                                "type": "object"
+                            }
+                            },
+                            "type": "function"
+                        }],
                         "agent_hint": {
                             "session_id": sub_order[i + 1],
                             "parent_session_id": psid,
@@ -400,6 +508,33 @@ def process_jiuwen(args: argparse.Namespace) -> None:
                     prefetch_data = {
                         "question": "",
                         "answer": "",
+                        "messages": [{"content": "", "role": "system"}],
+                        "tools": [{
+                            "function": {
+                            "description": "",
+                            "name": "read_pdf",
+                            "parameters": {
+                                "additionalProperties": True,
+                                "properties": {
+                                "call_goal": {
+                                    "description": "call goal",
+                                    "type": "string"
+                                },
+                                "inputs": {
+                                    "additionalProperties": {},
+                                    "description": "inputs",
+                                    "type": "object"
+                                }
+                                },
+                                "required": [
+                                "inputs"
+                                ],
+                                "title": "read pdf",
+                                "type": "object"
+                            }
+                            },
+                            "type": "function"
+                        }],
                         "agent_hint": {
                             "session_id": sid,
                             "parent_session_id": psid,
@@ -421,6 +556,33 @@ def process_jiuwen(args: argparse.Namespace) -> None:
                     offload_data = {
                         "question": "",
                         "answer": "",
+                        "messages": [{"content": "", "role": "system"}],
+                        "tools": [{
+                            "function": {
+                            "description": "",
+                            "name": "read_pdf",
+                            "parameters": {
+                                "additionalProperties": True,
+                                "properties": {
+                                "call_goal": {
+                                    "description": "call goal",
+                                    "type": "string"
+                                },
+                                "inputs": {
+                                    "additionalProperties": {},
+                                    "description": "inputs",
+                                    "type": "object"
+                                }
+                                },
+                                "required": [
+                                "inputs"
+                                ],
+                                "title": "read pdf",
+                                "type": "object"
+                            }
+                            },
+                            "type": "function"
+                        }],
                         "agent_hint": {
                             "session_id": sid,
                             "parent_session_id": psid,
@@ -439,6 +601,33 @@ def process_jiuwen(args: argparse.Namespace) -> None:
                     evict_data = {
                         "question": "",
                         "answer": "",
+                        "messages": [{"content": "", "role": "system"}],
+                        "tools": [{
+                            "function": {
+                            "description": "",
+                            "name": "read_pdf",
+                            "parameters": {
+                                "additionalProperties": True,
+                                "properties": {
+                                "call_goal": {
+                                    "description": "call goal",
+                                    "type": "string"
+                                },
+                                "inputs": {
+                                    "additionalProperties": {},
+                                    "description": "inputs",
+                                    "type": "object"
+                                }
+                                },
+                                "required": [
+                                "inputs"
+                                ],
+                                "title": "read pdf",
+                                "type": "object"
+                            }
+                            },
+                            "type": "function"
+                        }],
                         "agent_hint": {
                             "session_id": sid,
                             "parent_session_id": psid,
@@ -457,6 +646,33 @@ def process_jiuwen(args: argparse.Namespace) -> None:
                     evict_data = {
                         "question": "",
                         "answer": "",
+                        "messages": [{"content": "", "role": "system"}],
+                        "tools": [{
+                            "function": {
+                            "description": "",
+                            "name": "read_pdf",
+                            "parameters": {
+                                "additionalProperties": True,
+                                "properties": {
+                                "call_goal": {
+                                    "description": "call goal",
+                                    "type": "string"
+                                },
+                                "inputs": {
+                                    "additionalProperties": {},
+                                    "description": "inputs",
+                                    "type": "object"
+                                }
+                                },
+                                "required": [
+                                "inputs"
+                                ],
+                                "title": "read pdf",
+                                "type": "object"
+                            }
+                            },
+                            "type": "function"
+                        }],
                         "agent_hint": {
                             "session_id": sid,
                             "parent_session_id": psid,
@@ -471,6 +687,33 @@ def process_jiuwen(args: argparse.Namespace) -> None:
                     end_data = {
                         "question": "",
                         "answer": "",
+                        "messages": [{"content": "", "role": "system"}],
+                        "tools": [{
+                            "function": {
+                            "description": "",
+                            "name": "read_pdf",
+                            "parameters": {
+                                "additionalProperties": True,
+                                "properties": {
+                                "call_goal": {
+                                    "description": "call goal",
+                                    "type": "string"
+                                },
+                                "inputs": {
+                                    "additionalProperties": {},
+                                    "description": "inputs",
+                                    "type": "object"
+                                }
+                                },
+                                "required": [
+                                "inputs"
+                                ],
+                                "title": "read pdf",
+                                "type": "object"
+                            }
+                            },
+                            "type": "function"
+                        }],
                         "agent_hint": {
                             "session_id": sid,
                             "parent_session_id": psid,
@@ -516,6 +759,33 @@ def process_jiuwen(args: argparse.Namespace) -> None:
             evict_obj = {
                 "question": "",
                 "answer": "",
+                "messages": [{"content": "", "role": "system"}],
+                "tools": [{
+                    "function": {
+                    "description": "",
+                    "name": "read_pdf",
+                    "parameters": {
+                        "additionalProperties": True,
+                        "properties": {
+                        "call_goal": {
+                            "description": "call goal",
+                            "type": "string"
+                        },
+                        "inputs": {
+                            "additionalProperties": {},
+                            "description": "inputs",
+                            "type": "object"
+                        }
+                        },
+                        "required": [
+                        "inputs"
+                        ],
+                        "title": "read pdf",
+                        "type": "object"
+                    }
+                    },
+                    "type": "function"
+                }],
                 "agent_hint": {
                     "context_management": {
                         "edits": [{"target": "session", "type": "evict"}],
@@ -570,9 +840,34 @@ def process_jiuwen(args: argparse.Namespace) -> None:
             if rec.get("question"):
                 rec["question"] = "11"
             if rec.get("messages"):
-                rec["messages"] = []    
+                rec["messages"] = [{"content": "11", "role": "system"}]
             if rec.get("tools"):
-                rec["tools"] = []    
+                rec["tools"] = [{
+                    "function": {
+                    "description": "",
+                    "name": "read_pdf",
+                    "parameters": {
+                        "additionalProperties": True,
+                        "properties": {
+                        "call_goal": {
+                            "description": "call goal",
+                            "type": "string"
+                        },
+                        "inputs": {
+                            "additionalProperties": {},
+                            "description": "inputs",
+                            "type": "object"
+                        }
+                        },
+                        "required": [
+                        "inputs"
+                        ],
+                        "title": "read pdf",
+                        "type": "object"
+                    }
+                    },
+                    "type": "function"
+                }]
         return dataset
 
 
@@ -803,6 +1098,33 @@ def append_evict_between_groups(records: list[dict], groups: list[list[int]]) ->
         evict_obj = {
             "question": "",
             "answer": "",
+            "messages": [{"content": "", "role": "system"}],
+            "tools": [{
+                "function": {
+                "description": "",
+                "name": "read_pdf",
+                "parameters": {
+                    "additionalProperties": True,
+                    "properties": {
+                    "call_goal": {
+                        "description": "call goal",
+                        "type": "string"
+                    },
+                    "inputs": {
+                        "additionalProperties": {},
+                        "description": "inputs",
+                        "type": "object"
+                    }
+                    },
+                    "required": [
+                    "inputs"
+                    ],
+                    "title": "read pdf",
+                    "type": "object"
+                }
+                },
+                "type": "function"
+            }],
             "agent_hint": {
                 "context_management": {
                     "edits": [{"target": "session", "type": "evict"}],
