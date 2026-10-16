@@ -48,10 +48,12 @@ python build_agent_dataset.py --src agent_dataset_pure.jsonl --output agent_data
 """
 
 import argparse
+import copy
 import json
 import os
 import random
 import re
+import string
 import sys
 from pathlib import Path
 from typing import Callable
@@ -629,6 +631,45 @@ def process_jiuwen(args: argparse.Namespace) -> None:
             out.extend(groups[psid])
         return out, kept_order
 
+    def copy_big_groups(dataset, n):
+        """按 parent_session_id 分大组，将每个大组复制 n 次。
+
+        每个副本的所有记录的 parent_session_id 在原值后拼接一个 8 字符随机串，
+        同时 session_id 也拼接同一个随机串，用于区分不同副本。
+        n=0 时不复制（仅保留原数据），返回新列表。
+        """
+        if n is None or n <= 0:
+            return dataset
+
+        # 1. 大组 by parent_session_id (first-seen order)
+        big_groups: dict[str, list[dict]] = {}
+        big_order: list[str] = []
+        for rec in dataset:
+            psid = (rec.get("agent_hint") or {}).get("parent_session_id", "")
+            if psid not in big_groups:
+                big_groups[psid] = []
+                big_order.append(psid)
+            big_groups[psid].append(rec)
+
+        out: list[dict] = []
+        for psid in big_order:
+            recs = big_groups[psid]
+            # 原始大组
+            out.extend(recs)
+            # 复制 n 次
+            for _ in range(n):
+                suffix = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+                for rec in recs:
+                    new_rec = copy.deepcopy(rec)
+                    ah = new_rec.get("agent_hint") or {}
+                    orig_psid = ah.get("parent_session_id", "")
+                    orig_sid = ah.get("session_id", "")
+                    ah["parent_session_id"] = orig_psid + suffix
+                    ah["session_id"] = orig_sid + suffix
+                    new_rec["agent_hint"] = ah
+                    out.append(new_rec)
+        return out
+
     # def cut_sessions(dataset, cut_count, session_count=None):
     #     """Backward-compatible wrapper: apply cut_session_outer first, then
     #     cut_session_inner. Returns (new_list, kept_order).
@@ -685,6 +726,10 @@ def process_jiuwen(args: argparse.Namespace) -> None:
     # 8. 按比例在部分session内部随机插入offload+prefetch暂停对
     if args.add_pause is not None:
         dataset = add_pause_in_session(dataset, args.add_pause)
+
+    # 9. 按parent_session_id分大组复制n次（副本的parent_session_id和session_id拼接随机后缀）
+    if getattr(args, "copy", None):
+        dataset = copy_big_groups(dataset, args.copy)
 
     out_path = resolve_path(args.output)
     with open(out_path, "w", encoding="utf-8") as f:
@@ -953,6 +998,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="(Jiuwen) Drop records whose question field token count exceeds "
              "this value. Requires --tokenizer. Applied before remove_manage_request. "
              "Skipped if not set.",
+    )
+    # Jiuwen-specific: copy each 大组 (by parent_session_id) n times.
+    parser.add_argument(
+        "--copy", type=int, default=None,
+        help="(Jiuwen) Copy each 大组 (grouped by parent_session_id) n times. "
+             "Each copy's parent_session_id and session_id are suffixed with the "
+             "same 8-char random string to distinguish different copies. "
+             "E.g. --copy 1 makes 1 extra copy (so 2x total). Skipped if not set.",
     )
     return parser
 
