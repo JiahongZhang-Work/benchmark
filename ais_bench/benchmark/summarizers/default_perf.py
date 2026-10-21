@@ -401,10 +401,20 @@ class DefaultPerfSummarizer:
         Args:
             tables_dict: Dictionary containing performance tables
         """
+        # stdout (print) and stderr (logging.StreamHandler) are independent
+        # streams. When a terminal merges them, the two streams have no
+        # shared ordering guarantee: a stderr log line can appear in the
+        # middle of a multi-line stdout table because stdout is buffered and
+        # stderr is not. We avoid the race entirely by writing the footer
+        # "Performance Result files located" line into the SAME stdout
+        # buffer as the tables, so the whole output (tables + footer) goes
+        # out as one atomic write to one stream.
+        output_lines: list[str] = []
         for task_name, tables in tables_dict.items():
-            self.logger.info(f"Performance Results of task [{task_name}]: ")
+            output_lines.append(f"Performance Results of task [{task_name}]:")
+            output_lines.append("")
             for table in tables:
-                print(
+                output_lines.append(
                     tabulate.tabulate(
                         table,
                         headers="firstrow",
@@ -415,9 +425,14 @@ class DefaultPerfSummarizer:
                         missingval="N/A",  # Handle empty values
                     )
                 )
+                output_lines.append("")
             model_name = task_name.split("/")[0]
             perf_result_dir = osp.join(self.work_dir, "performances", model_name)
-            self.logger.info(f"Performance Result files located in {perf_result_dir}.")
+            output_lines.append(f"Performance Result files located in {perf_result_dir}.")
+            output_lines.append("")
+        # Single write to stdout — tables and footer share one stream, so no
+        # cross-stream interleaving is possible.
+        print("\n".join(output_lines), flush=True)
 
     def summarize(self):
         """Summarize performance results for all models and datasets.
