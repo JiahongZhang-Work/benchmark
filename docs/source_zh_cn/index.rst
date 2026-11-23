@@ -58,6 +58,9 @@ AISBench Benchmark 是基于 `OpenCompass <https://github.com/open-compass/openc
    advanced_tutorials/spec_decode
    advanced_tutorials/prefix_cache
    advanced_tutorials/response_anomaly_detection
+   advanced_tutorials/session_aware_agent_hint
+   advanced_tutorials/agent_hint_perf_runbook
+   advanced_tutorials/agent_hint_perf_sop
 
 
 

@@ -113,7 +113,12 @@ class OpenICLApiInferTask(BaseTask):
             "session_concurrency", self.concurrency
         )
         self.pass_agent_hint = self.model_cfg.get("pass_agent_hint", False)
-        # These three are inferencer-only switches, NOT model parameters.
+        self.skip_prefetch = self.model_cfg.get("skip_prefetch", False)
+        self.agent_header_mode = self.model_cfg.get("agent_header_mode", False)
+        self.agent_offload_wait_s = self.model_cfg.get("agent_offload_wait_s", 0.0)
+        self.agent_status_audit_file = self.model_cfg.get("agent_status_audit_file", "")
+        # Inferencer-only switches are NOT model parameters. agent_header_mode
+        # remains in model_cfg because VLLMCustomAPI also needs it for wire encoding.
         # We still need them present in the dumped task config (self.cfg) so the
         # inference subprocess (which reloads config from the param file) can read
         # session_aware/session_concurrency/pass_agent_hint. So pop them only from
@@ -122,7 +127,14 @@ class OpenICLApiInferTask(BaseTask):
         # dumped. (Popping the aliased dict before dump lost the switches and made
         # the subprocess read session_aware=False / pass_agent_hint=False.)
         self.model_cfg = copy.deepcopy(self.model_cfg)
-        for _key in ("session_aware", "session_concurrency", "pass_agent_hint"):
+        for _key in (
+            "session_aware",
+            "session_concurrency",
+            "pass_agent_hint",
+            "skip_prefetch",
+            "agent_offload_wait_s",
+            "agent_status_audit_file",
+        ):
             self.model_cfg.pop(_key, None)
         self.inferencer_cfg = self.dataset_cfgs[0]["infer_cfg"]["inferencer"]
         self.inferencer_cfg["model_cfg"] = self.model_cfg
@@ -132,6 +144,10 @@ class OpenICLApiInferTask(BaseTask):
         self.inferencer_cfg["session_aware"] = self.session_aware
         self.inferencer_cfg["session_concurrency"] = self.session_concurrency
         self.inferencer_cfg["pass_agent_hint"] = self.pass_agent_hint
+        self.inferencer_cfg["skip_prefetch"] = self.skip_prefetch
+        self.inferencer_cfg["agent_header_mode"] = self.agent_header_mode
+        self.inferencer_cfg["agent_offload_wait_s"] = self.agent_offload_wait_s
+        self.inferencer_cfg["agent_status_audit_file"] = self.agent_status_audit_file
         self.inferencer_cfg["output_json_filepath"] = self.work_dir
         self.logger.debug(f"Inferencer config: {self.inferencer_cfg}")
         # Control switch for async tasks within process

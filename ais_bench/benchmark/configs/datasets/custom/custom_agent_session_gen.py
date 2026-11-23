@@ -1,3 +1,7 @@
+def _env(key, default=None):
+    return __import__("os").environ.get(key, default)
+
+
 from ais_bench.benchmark.openicl.icl_prompt_template import PromptTemplate
 from ais_bench.benchmark.openicl.icl_retriever import ZeroRetriever
 from ais_bench.benchmark.openicl.icl_inferencer import GenInferencer
@@ -34,7 +38,7 @@ agent_demo_datasets = [
     dict(
         abbr='session-agent',
         type=CustomDataset,
-        path='ais_bench/datasets/agent/example.jsonl',
+        path=_env("AGENT_DATASET", "ais_bench/datasets/agent/example.jsonl"),
         reader_cfg=agent_reader_cfg,
         infer_cfg=agent_infer_cfg,
         eval_cfg=agent_eval_cfg,

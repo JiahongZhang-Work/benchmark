@@ -432,6 +432,7 @@ class BaseAPIModel(BaseModel):
         max_out_len: int,
         output: Output,
         session: aiohttp.ClientSession = None,
+        request_headers: dict = None,
         **args,
     ):
         if not session:
@@ -449,10 +450,11 @@ class BaseAPIModel(BaseModel):
         retry_count = 0
         for _ in range(self.retry):
             try:
+                infer_kwargs = {} if request_headers is None else {"request_headers": request_headers}
                 if self.stream:
-                    await self.stream_infer(request_body, output)
+                    await self.stream_infer(request_body, output, **infer_kwargs)
                 else:
-                    await self.text_infer(request_body, output)
+                    await self.text_infer(request_body, output, **infer_kwargs)
                 # break retry loop when request is successful
                 break
             except asyncio.exceptions.CancelledError as e:
@@ -479,10 +481,11 @@ class BaseAPIModel(BaseModel):
             await self.session.close()
         return output
 
-    async def stream_infer(self, request_body: dict, output: Output):
+    async def stream_infer(self, request_body: dict, output: Output, request_headers: dict = None):
         await output.record_time_point()
+        headers = self.headers if request_headers is None else request_headers
         async with self.session.post(
-            url=self.url, json=request_body, headers=self.headers
+            url=self.url, json=request_body, headers=headers
         ) as response:
             if response.status == 200:
                 async for raw_chunk in self.iter_lines(response.content):
@@ -512,10 +515,11 @@ class BaseAPIModel(BaseModel):
                 output.error_info = response.reason
                 output.success = False
 
-    async def text_infer(self, request_body, output: Output):
+    async def text_infer(self, request_body, output: Output, request_headers: dict = None):
         await output.record_time_point()
+        headers = self.headers if request_headers is None else request_headers
         async with self.session.post(
-            url=self.url, json=request_body, headers=self.headers
+            url=self.url, json=request_body, headers=headers
         ) as response:
             if response.status == 200:
                 raw_data = await response.text()
