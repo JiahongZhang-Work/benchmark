@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import urllib
@@ -51,6 +52,7 @@ class VLLMCustomAPI(BaseAPIModel):
         enable_ssl: bool = False,
         verbose: bool = False,
         use_chat_api: bool = False,
+        agent_header_mode: bool = False,
     ):
         super().__init__(
             path=path,
@@ -71,6 +73,7 @@ class VLLMCustomAPI(BaseAPIModel):
             self.logger.info(f"API key is set")
         self.model = model if model else self._get_service_model_path()
         self.use_chat_api = use_chat_api
+        self.agent_header_mode = bool(agent_header_mode)
         self.url = self._get_url()
         self.template_parser = LMTemplateParser(meta_template)
         # For non-chat APIs, the actual prompt is passed as a plain string (just like with offline models), so LMTemplateParser is used.
@@ -112,6 +115,51 @@ class VLLMCustomAPI(BaseAPIModel):
         if data_id is None:
             return None
         return self.lora_data_map.get(f"{data_id}")
+
+    @staticmethod
+    def _encode_agent_hint_header(agent_hint: dict) -> str:
+        session_id = agent_hint.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("agent_header_mode requires a non-empty agent_hint.session_id")
+        session = {"session_id": session_id}
+        parent_session_id = agent_hint.get("parent_session_id")
+        if parent_session_id is not None:
+            if not isinstance(parent_session_id, str) or not parent_session_id:
+                raise ValueError("agent_hint.parent_session_id must be a non-empty string when provided")
+            session["parent_session_id"] = parent_session_id
+        payload = {"session": session}
+        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    async def generate(
+        self,
+        input_data: PromptType,
+        max_out_len: int,
+        output: Output,
+        session=None,
+        **args,
+    ):
+        request_headers = None
+        if self.agent_header_mode:
+            agent_hint = args.pop("agent_hint", None)
+            if agent_hint:
+                if not isinstance(agent_hint, dict):
+                    raise ValueError("agent_hint must be a dict in agent_header_mode")
+                context_management = agent_hint.get("context_management") or {}
+                if context_management.get("manage_request") is True:
+                    raise ValueError(
+                        "KVC manage records must be sent as /agent-status events in agent_header_mode"
+                    )
+                request_headers = dict(self.headers)
+                request_headers["X-Agent-Hint"] = self._encode_agent_hint_header(agent_hint)
+        return await super().generate(
+            input_data,
+            max_out_len,
+            output,
+            session=session,
+            request_headers=request_headers,
+            **args,
+        )
 
     async def get_request_body(
         self, input_data: PromptType, max_out_len: int, output: Output, **args

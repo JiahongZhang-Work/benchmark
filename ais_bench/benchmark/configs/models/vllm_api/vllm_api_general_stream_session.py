@@ -1,3 +1,7 @@
+def _env(key, default=None):
+    return __import__("os").environ.get(key, default)
+
+
 from ais_bench.benchmark.models import VLLMCustomAPI
 
 models = [
@@ -5,30 +9,30 @@ models = [
         attr="service",
         type=VLLMCustomAPI,
         abbr="vllm-api-general-stream-session",
-        path="/mnt/weight/Qwen3-8B",
-        model="qwen",
+        path=_env("AGENT_WEIGHT_PATH", "/mnt/weight/DeepSeek-V4-Flash"),
+        model=_env("AGENT_MODEL", "dsv4flash"),
         stream=True,
-        use_chat_api=True,            # 发送到 v1/chat/completions
-        session_aware=True,           # 启用 session 模式
-        session_concurrency=4,        # 同时活跃的 session 数上限（跨 session 在途总数）
-        # pass_agent_hint：False 时 agent_hint 仅用于内部（提取 session_id/stage），不透传到 API;
-        # True 时把 agent_hint 作为额外字段合并进 vLLM 请求 body。
-        pass_agent_hint=True,
-        # batch_size 在 session 模式下退化为 janus 队列容量（producer -> dispatcher 的缓冲）
-        # 推荐设为 session_concurrency，dispatcher 实时路由，每个 session 按需取下一条
-        batch_size=4,
-        request_rate=0,               # 0=不限速；设 >0 可在 session 并发基础上叠加全局 RPS 限速
+        use_chat_api=True,
+        session_aware=True,
+        session_concurrency=int(_env("AGENT_CONCURRENCY", "4")),
+        pass_agent_hint=_env("AGENT_PASS_HINT", "0") == "1",
+        skip_prefetch=_env("AGENT_SKIP_PREFETCH", "0") == "1",
+        agent_header_mode=_env("AGENT_HEADER_MODE", "0") == "1",
+        agent_offload_wait_s=float(_env("AGENT_OFFLOAD_WAIT_S", "0")),
+        agent_status_audit_file=_env("AGENT_STATUS_AUDIT_FILE", ""),
+        batch_size=int(_env("AGENT_BATCH_SIZE", _env("AGENT_CONCURRENCY", "4"))),
+        request_rate=0,
         use_timestamp=False,
-        retry=2,
+        retry=int(_env("AGENT_RETRY", "2")),
         api_key="",
-        host_ip="localhost",
-        host_port=31036,
+        host_ip=_env("AGENT_HOST", "127.0.0.1"),
+        host_port=int(_env("AGENT_PORT", "8000")),
         url="",
-        max_out_len=256,
+        max_out_len=int(_env("AGENT_MAX_OUT_LEN", "256")),
         trust_remote_code=False,
         generation_kwargs=dict(
             temperature=0,
-            ignore_eos=False,
+            ignore_eos=_env("AGENT_IGNORE_EOS", "0") == "1",
         ),
     )
 ]

@@ -52,6 +52,7 @@ python build_agent_dataset.py --src agent_dataset_pure.jsonl --output agent_data
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 import random
@@ -175,6 +176,366 @@ def _make_manage_request(
 # ---------------------------------------------------------------------------
 # Shared helpers used by both Jiuwen and default processors.
 # ---------------------------------------------------------------------------
+def _group_records_by_session(dataset):
+    groups: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for rec in dataset:
+        sid = (rec.get("agent_hint") or {}).get("session_id", "")
+        if sid not in groups:
+            groups[sid] = []
+            order.append(sid)
+        groups[sid].append(rec)
+    return groups, order
+
+
+def _prompt_token_map(dataset, tokenizer) -> dict[int, int]:
+    token_lens: dict[int, int] = {}
+    for rec in dataset:
+        question = rec.get("question", "") or ""
+        token_lens[id(rec)] = len(tokenizer.encode(question).ids)
+    return token_lens
+
+
+def _split_kvc_session(records, token_lens, pause_min_prompt_tokens, interleave_turns):
+    lengths = [token_lens[id(rec)] for rec in records]
+    cut_at = next(
+        (idx for idx, length in enumerate(lengths) if length >= pause_min_prompt_tokens),
+        None,
+    )
+    if cut_at is None or cut_at >= len(records) - 1:
+        return [list(records)], False
+
+    segments = [list(records[: cut_at + 1])]
+    for start in range(cut_at + 1, len(records), interleave_turns):
+        segments.append(list(records[start:start + interleave_turns]))
+    return segments, True
+
+
+def _pair_kvc_sessions(sessions):
+    eligible = sorted(
+        (item for item in sessions if item["eligible"]),
+        key=lambda item: (-item["max_prompt_tokens"], item["session_id"]),
+    )
+    ineligible = sorted(
+        (item for item in sessions if not item["eligible"]),
+        key=lambda item: (-item["max_prompt_tokens"], item["session_id"]),
+    )
+    ordered = eligible + ineligible
+    pairs = []
+    for idx in range(0, len(ordered), 2):
+        first = ordered[idx]
+        second = ordered[idx + 1] if idx + 1 < len(ordered) else None
+        if second is None:
+            first["segments"] = [list(first["records"])]
+            first["eligible"] = False
+        pair = (first, second)
+        pairs.append(pair)
+
+    pairs.sort(
+        key=lambda pair: -(
+            pair[0]["max_prompt_tokens"]
+            + (pair[1]["max_prompt_tokens"] if pair[1] is not None else 0)
+        )
+    )
+    balanced = []
+    left, right = 0, len(pairs) - 1
+    while left <= right:
+        balanced.append(pairs[left])
+        if left != right:
+            balanced.append(pairs[right])
+        left += 1
+        right -= 1
+    return balanced
+
+
+def _kvc_pair_descriptors(primary, secondary):
+    descriptors = []
+    if secondary is None:
+        descriptors.append({"session": primary, "records": list(primary["records"]), "tail": True})
+    else:
+        primary_segments = primary["segments"]
+        secondary_segments = secondary["segments"]
+        shared_count = min(len(primary_segments), len(secondary_segments))
+        if len(primary_segments) != len(secondary_segments):
+            shared_count = max(0, shared_count - 1)
+        for idx in range(shared_count):
+            descriptors.append({"session": primary, "records": primary_segments[idx], "tail": False})
+            descriptors.append({"session": secondary, "records": secondary_segments[idx], "tail": False})
+        if len(primary_segments) > shared_count:
+            tail_records = [
+                rec
+                for segment in primary_segments[shared_count:]
+                for rec in segment
+            ]
+            descriptors.append({"session": primary, "records": tail_records, "tail": True})
+        if len(secondary_segments) > shared_count:
+            tail_records = [
+                rec
+                for segment in secondary_segments[shared_count:]
+                for rec in segment
+            ]
+            descriptors.append({"session": secondary, "records": tail_records, "tail": True})
+    return descriptors
+
+
+def build_kvc_interleaved_dataset(
+    dataset,
+    tokenizer,
+    pause_min_prompt_tokens=16384,
+    interleave_turns=4,
+    prefetch_lead_requests=1,
+    output_token_cap=256,
+    max_model_len=None,
+):
+    if pause_min_prompt_tokens < 1:
+        raise ValueError("pause_min_prompt_tokens must be >= 1")
+    if interleave_turns < 1:
+        raise ValueError("interleave_turns must be >= 1")
+    if prefetch_lead_requests < 0:
+        raise ValueError("prefetch_lead_requests must be >= 0")
+
+    groups, order = _group_records_by_session(dataset)
+    token_lens = _prompt_token_map(dataset, tokenizer)
+    sessions = []
+    for sid in order:
+        records = groups[sid]
+        for rec in records:
+            ah = rec.get("agent_hint") or {}
+            ah.pop("cache_control", None)
+            rec["agent_hint"] = ah
+        original_max = max(token_lens[id(rec)] for rec in records)
+        segments, eligible = _split_kvc_session(
+            records,
+            token_lens,
+            pause_min_prompt_tokens,
+            interleave_turns,
+        )
+        sessions.append(
+            {
+                "session_id": sid,
+                "records": records,
+                "segments": segments,
+                "eligible": eligible,
+                "max_prompt_tokens": original_max,
+            }
+        )
+
+    if max_model_len is not None:
+        violations = []
+        for session in sessions:
+            for rec in session["records"]:
+                prompt_tokens = token_lens[id(rec)]
+                max_tokens = max(1, int(rec.get("max_tokens") or 1))
+                if output_token_cap is not None:
+                    max_tokens = min(max_tokens, output_token_cap)
+                if prompt_tokens + max_tokens + 512 > max_model_len:
+                    violations.append(
+                        {
+                            "session_id": session["session_id"],
+                            "prompt_tokens": prompt_tokens,
+                            "max_tokens": max_tokens,
+                        }
+                    )
+        if violations:
+            worst = max(violations, key=lambda item: item["prompt_tokens"])
+            raise ValueError(
+                "KVC dataset exceeds max_model_len gate: "
+                f"worst session={worst['session_id']} "
+                f"prompt_tokens={worst['prompt_tokens']} max_tokens={worst['max_tokens']} "
+                f"max_model_len={max_model_len}"
+            )
+
+    pairs = _pair_kvc_sessions(sessions)
+    output = []
+    parent_manifest = []
+    parent_count = 0
+    for primary, secondary in pairs:
+        parent_count += 1
+        parent_id = primary["session_id"]
+        pair_sessions = [item for item in (primary, secondary) if item is not None]
+        for session in pair_sessions:
+            for rec in session["records"]:
+                ah = rec.get("agent_hint") or {}
+                ah["parent_session_id"] = parent_id
+                rec["agent_hint"] = ah
+
+        descriptors = _kvc_pair_descriptors(primary, secondary)
+        last_descriptor_by_session = {}
+        for idx, descriptor in enumerate(descriptors):
+            last_descriptor_by_session[descriptor["session"]["session_id"]] = idx
+
+        prefetch_into = {}
+        seen_sessions = set()
+        for idx, descriptor in enumerate(descriptors):
+            sid = descriptor["session"]["session_id"]
+            if sid in seen_sessions and idx > 0:
+                prefetch_into.setdefault(idx - 1, []).append(descriptor["session"])
+            seen_sessions.add(sid)
+
+        pair_output = []
+        for idx, descriptor in enumerate(descriptors):
+            session = descriptor["session"]
+            sid = session["session_id"]
+            records = descriptor["records"]
+            targets = prefetch_into.get(idx, [])
+            if targets:
+                lead = min(prefetch_lead_requests, len(records))
+                split_at = len(records) - lead
+                pair_output.extend(records[:split_at])
+                for target in targets:
+                    pair_output.append(
+                        _make_manage_request(target["session_id"], parent_id, "prefetch")
+                    )
+                pair_output.extend(records[split_at:])
+            else:
+                pair_output.extend(records)
+            if idx != last_descriptor_by_session[sid]:
+                pair_output.append(_make_manage_request(sid, parent_id, "offload"))
+            else:
+                pair_output.append(_make_manage_request(sid, parent_id, "evict"))
+                if idx != len(descriptors) - 1:
+                    pair_output.append(
+                        _make_manage_request(
+                            sid,
+                            parent_id,
+                            "",
+                            stage="end",
+                            manage_request=True,
+                        )
+                    )
+        output.extend(pair_output)
+        parent_manifest.append(
+            {
+                "parent_id": parent_id,
+                "primary_session_id": primary["session_id"],
+                "secondary_session_id": secondary["session_id"] if secondary else None,
+                "primary_segments": len(primary["segments"]),
+                "secondary_segments": len(secondary["segments"]) if secondary else 0,
+                "primary_max_prompt_tokens": primary["max_prompt_tokens"],
+                "secondary_max_prompt_tokens": secondary["max_prompt_tokens"] if secondary else 0,
+                "records": len(pair_output),
+                "descriptors": [
+                    {
+                        "session_id": descriptor["session"]["session_id"],
+                        "records": len(descriptor["records"]),
+                        "tail": descriptor["tail"],
+                    }
+                    for descriptor in descriptors
+                ],
+            }
+        )
+
+    for rec in output:
+        ah = rec.get("agent_hint") or {}
+        ah.pop("cache_control", None)
+        rec["agent_hint"] = ah
+        if (ah.get("context_management") or {}).get("manage_request"):
+            continue
+        if output_token_cap is not None and rec.get("max_tokens"):
+            rec["max_tokens"] = min(int(rec["max_tokens"]), output_token_cap)
+
+    prefetch_events = []
+    data_plane_count = sum(
+        1
+        for rec in output
+        if not ((rec.get("agent_hint") or {}).get("context_management") or {}).get(
+            "manage_request"
+        )
+    )
+    manage_count = len(output) - data_plane_count
+    for idx, rec in enumerate(output):
+        ah = rec.get("agent_hint") or {}
+        cm = ah.get("context_management") or {}
+        edits = cm.get("edits") or []
+        if not any(isinstance(edit, dict) and edit.get("type") == "prefetch" for edit in edits):
+            continue
+        sid = ah.get("session_id")
+        resume_idx = None
+        lead_data_requests = 0
+        for next_idx in range(idx + 1, len(output)):
+            next_ah = output[next_idx].get("agent_hint") or {}
+            next_cm = next_ah.get("context_management") or {}
+            if next_cm.get("manage_request"):
+                continue
+            if next_ah.get("session_id") == sid:
+                resume_idx = next_idx
+                break
+            lead_data_requests += 1
+        if resume_idx is not None:
+            prefetch_events.append(
+                {
+                    "prefetch_index": idx,
+                    "resume_index": resume_idx,
+                    "session_id": sid,
+                    "lead_data_requests": lead_data_requests,
+                    "resume_prompt_tokens": token_lens.get(id(output[resume_idx])),
+                }
+            )
+
+    edit_counts = {"offload": 0, "prefetch": 0, "evict": 0, "end": 0}
+    for rec in output:
+        ah = rec.get("agent_hint") or {}
+        cm = ah.get("context_management") or {}
+        if not cm.get("manage_request"):
+            continue
+        if ah.get("stage") == "end":
+            edit_counts["end"] += 1
+            continue
+        for edit in cm.get("edits") or []:
+            if isinstance(edit, dict) and edit.get("type") in edit_counts:
+                edit_counts[edit["type"]] += 1
+
+    manifest = {
+        "builder_mode": "kvc_interleave",
+        "config": {
+            "pause_min_prompt_tokens": pause_min_prompt_tokens,
+            "interleave_turns": interleave_turns,
+            "prefetch_lead_requests": prefetch_lead_requests,
+            "output_token_cap": output_token_cap,
+            "max_model_len": max_model_len,
+        },
+        "counts": {
+            "parents": parent_count,
+            "sessions": len(sessions),
+            "data_plane": data_plane_count,
+            "manage": manage_count,
+            **edit_counts,
+        },
+        "coverage": {
+            "prefetch_resume_requests": len(prefetch_events),
+            "prefetch_resume_ratio_of_data": (
+                len(prefetch_events) / data_plane_count if data_plane_count else 0.0
+            ),
+            "sessions_reaching_pause_threshold": sum(
+                1 for item in sessions if item["max_prompt_tokens"] >= pause_min_prompt_tokens
+            ),
+            "sessions_split_for_pauses": sum(1 for item in sessions if item["eligible"]),
+            "min_actual_lead_data_requests": min(
+                (event["lead_data_requests"] for event in prefetch_events),
+                default=None,
+            ),
+            "max_actual_lead_data_requests": max(
+                (event["lead_data_requests"] for event in prefetch_events),
+                default=None,
+            ),
+        },
+        "prompt_tokens": {
+            "max": max(token_lens.values()) if token_lens else 0,
+            "resume_min": min(
+                (event["resume_prompt_tokens"] for event in prefetch_events),
+                default=None,
+            ),
+            "resume_max": max(
+                (event["resume_prompt_tokens"] for event in prefetch_events),
+                default=None,
+            ),
+        },
+        "parents": parent_manifest,
+        "prefetch_events": prefetch_events,
+    }
+    return output, manifest
+
+
 def add_pause_in_session(dataset, percent, swe_format=False):
     """Insert an offload+prefetch pair at a random position inside
     ``percent`` fraction of sessions.
@@ -390,7 +751,7 @@ def process_jiuwen(args: argparse.Namespace) -> None:
             f for f in d.iterdir()
             if f.is_file() and f.name.startswith("G") and f.name.endswith(".json")
         ]
-        json_files.sort(key=lambda f: extract_s_r(f.name))
+        json_files.sort(key=lambda f: (*extract_s_r(f.name), f.name))
         return json_files
 
     def parse_file_name(file_name: str):
@@ -802,6 +1163,29 @@ def process_jiuwen(args: argparse.Namespace) -> None:
                     out.append(new_rec)
         return out
 
+    kvc_interleave = bool(getattr(args, "kvc_interleave", False))
+    if kvc_interleave:
+        if swe_format:
+            raise ValueError("--kvc-interleave does not support --swe-format")
+        if tokenizer is None:
+            raise ValueError("--kvc-interleave requires a valid --tokenizer")
+        incompatible = [
+            name
+            for name, value in (
+                ("--cut-count", args.cut_count),
+                ("--session-count", args.session_count),
+                ("--add-pause", args.add_pause),
+                ("--copy", getattr(args, "copy", None)),
+                ("--max-token-len", getattr(args, "max_token_len", None)),
+                ("--evict", getattr(args, "evict", False)),
+            )
+            if value
+        ]
+        if incompatible:
+            raise ValueError(
+                "--kvc-interleave cannot be combined with: " + ", ".join(incompatible)
+            )
+
     json_files = get_files(src_dir)
     all_records = []
     n_files = len(json_files)
@@ -811,59 +1195,87 @@ def process_jiuwen(args: argparse.Namespace) -> None:
         if i % 100 == 0 or i == n_files:
             print(f"[Jiuwen]   {i}/{n_files} files parsed")
 
-    # 2. 按max_token_len过滤超长question
-    if getattr(args, "max_token_len", None) is not None:
+    if not kvc_interleave and getattr(args, "max_token_len", None) is not None:
         all_records = filter_token_len(all_records, args.max_token_len)
 
-    # 3. --preview：把question字段替换为占位"preview text"
-    all_records = process_preview(all_records)
+    if not kvc_interleave:
+        all_records = process_preview(all_records)
 
-    # 4. 删除自带的管理请求
     dataset = remove_manage_request(all_records)
-
-    # 4.1 按session_id重新编号stage（每个session独立 start → stage-1 → ...）
     dataset = renumber_stage_per_session(dataset)
 
-    # 5. 每个session内部截取尾部cut_count条数据
-    if args.cut_count:
-        dataset, _ = cut_session_inner(dataset, args.cut_count)
-
-    # 6. 按parent_session_id分大组，内部按session_id分小组插入管理请求
-    # 6.1 --evict：中断小组末尾加 offload、后一段同 sid 小组开头加 prefetch（非相邻配对）；
-    #     未中断小组加 evict+end；大组最后小组仅加 evict。
-    # 6.2 默认：每两个相邻小组之间插入 offload+prefetch，再在每个 session 末尾追加 evict。
-    if getattr(args, "evict", False):
-        dataset = group_by_parent_sessions_evict(dataset)
-    else:
-        dataset = group_by_parent_sessions(dataset)
-        # 每个session末尾追加evict管理请求
-        dataset = add_evict_manage_request(dataset)
-
-    # 7. 保留前session_count个大组（按parent_session_id分组）
-    dataset, order = cut_session_outer(dataset, args.session_count)
-
-    # 8. 按比例在部分session内部随机插入offload+prefetch暂停对
-    if args.add_pause is not None:
-        dataset = add_pause_in_session(dataset, args.add_pause, swe_format=swe_format)
-
-    # 9. 按parent_session_id分大组复制n次（副本的parent_session_id和session_id拼接随机后缀）
-    if getattr(args, "copy", None):
-        dataset = copy_big_groups(dataset, args.copy)
-
-    # 10. --preview：打印数据集结构（大组/小组/stage/manage_request）
-    if args.preview:
-        print_dataset_structure(
+    manifest = None
+    if kvc_interleave:
+        dataset, manifest = build_kvc_interleaved_dataset(
             dataset,
+            tokenizer,
+            pause_min_prompt_tokens=getattr(
+                args, "kvc_pause_min_prompt_tokens", 16384
+            ),
+            interleave_turns=getattr(args, "kvc_interleave_turns", 4),
+            prefetch_lead_requests=getattr(args, "kvc_prefetch_lead_requests", 1),
+            output_token_cap=getattr(args, "output_token_cap", 256),
+            max_model_len=getattr(args, "max_model_len", None),
+        )
+        order = [parent["parent_id"] for parent in manifest["parents"]]
+    else:
+        if args.cut_count:
+            dataset, _ = cut_session_inner(dataset, args.cut_count)
+
+        if getattr(args, "evict", False):
+            dataset = group_by_parent_sessions_evict(dataset)
+        else:
+            dataset = group_by_parent_sessions(dataset)
+            dataset = add_evict_manage_request(dataset)
+
+        dataset, order = cut_session_outer(dataset, args.session_count)
+
+        if args.add_pause is not None:
+            dataset = add_pause_in_session(dataset, args.add_pause, swe_format=swe_format)
+
+        if getattr(args, "copy", None):
+            dataset = copy_big_groups(dataset, args.copy)
+
+    if args.preview:
+        preview_dataset = process_preview([copy.deepcopy(rec) for rec in dataset])
+        print_dataset_structure(
+            preview_dataset,
             title=f"Jiuwen Preview ({args.output})",
             show_agent_hint=getattr(args, "show_agent_hint", False),
         )
+        dataset = preview_dataset
 
     out_path = resolve_path(args.output)
     with open(out_path, "w", encoding="utf-8") as f:
         for record in dataset:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    print(f"[Jiuwen] Done: {len(dataset)} records (from {len(order)} sessions) -> {out_path}")
+    if manifest is not None:
+        digest = hashlib.sha256(out_path.read_bytes()).hexdigest()
+        manifest["output"] = str(out_path)
+        manifest["sha256"] = digest
+        manifest_path = getattr(args, "manifest", None)
+        manifest_out = (
+            resolve_path(manifest_path)
+            if manifest_path
+            else out_path.with_suffix(out_path.suffix + ".manifest.json")
+        )
+        with open(manifest_out, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        counts = manifest["counts"]
+        coverage = manifest["coverage"]
+        print(
+            "[Jiuwen] KVC manifest: "
+            f"parents={counts['parents']} sessions={counts['sessions']} "
+            f"data={counts['data_plane']} offload={counts['offload']} "
+            f"prefetch={counts['prefetch']} evict={counts['evict']} "
+            f"end={counts['end']} resume_ratio="
+            f"{coverage['prefetch_resume_ratio_of_data']:.3f} "
+            f"manifest={manifest_out}"
+        )
+
+    print(f"[Jiuwen] Done: {len(dataset)} records (from {len(order)} groups) -> {out_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -1168,6 +1580,41 @@ def build_parser() -> argparse.ArgumentParser:
              "messages/tools. [default] wraps the decoded token text into a "
              "single user message + placeholder tools. Use this for "
              "chat-completions endpoints that expect the messages array.",
+    )
+    parser.add_argument(
+        "--kvc-interleave", action="store_true", default=False,
+        help="[Jiuwen only] Build deterministic two-session interleaved KVC "
+             "trajectories: offload -> pressure run -> prefetch -> lead -> "
+             "resume, then one evict per session.",
+    )
+    parser.add_argument(
+        "--kvc-pause-min-prompt-tokens", type=int, default=16384,
+        help="[Jiuwen KVC only] Minimum prompt tokens before creating a pause.",
+    )
+    parser.add_argument(
+        "--kvc-interleave-turns", type=int, default=4,
+        help="[Jiuwen KVC only] Data-plane turns per interleaved run after "
+             "the first pause threshold.",
+    )
+    parser.add_argument(
+        "--kvc-prefetch-lead-requests", type=int, default=1,
+        help="[Jiuwen KVC only] Number of pressure data requests to keep "
+             "after prefetch and before the resumed request.",
+    )
+    parser.add_argument(
+        "--output-token-cap", type=int, default=256,
+        help="[Jiuwen KVC only] Cap each data-plane max_tokens; original "
+             "smaller values are preserved.",
+    )
+    parser.add_argument(
+        "--max-model-len", type=int, default=None,
+        help="[Jiuwen KVC only] Validation gate. Requires every "
+             "prompt + capped max_tokens + 512 <= this value.",
+    )
+    parser.add_argument(
+        "--manifest", default=None,
+        help="[Jiuwen KVC only] Manifest output path. Defaults to "
+             "<output>.manifest.json.",
     )
     return parser
 

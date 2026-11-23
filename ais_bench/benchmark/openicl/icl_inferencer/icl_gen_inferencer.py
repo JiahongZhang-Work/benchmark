@@ -1,9 +1,14 @@
 """Direct Generation Inferencer."""
 
+import asyncio
 import copy
+import json
+import os
+import time
 import uuid
 from multiprocessing import BoundedSemaphore
 from typing import List, Optional, Dict
+from urllib.parse import urljoin
 
 import aiohttp
 
@@ -13,6 +18,9 @@ from ais_bench.benchmark.openicl.icl_retriever import BaseRetriever
 from ais_bench.benchmark.openicl.icl_inferencer.icl_base_api_inferencer import BaseApiInferencer
 from ais_bench.benchmark.openicl.icl_inferencer.icl_base_local_inferencer import BaseLocalInferencer
 from ais_bench.benchmark.openicl.icl_inferencer.output_handler.gen_inferencer_output_handler import GenInferencerOutputHandler
+
+
+_AGENT_EDIT_TO_STATUS = {"offload": "pause", "prefetch": "resume", "evict": "finalize"}
 
 
 @ICL_INFERENCERS.register_module()
@@ -62,6 +70,69 @@ class GenInferencer(BaseApiInferencer, BaseLocalInferencer):
             ),
         )
 
+    def _write_agent_status_audit(self, record: dict) -> None:
+        if not self.agent_status_audit_file:
+            return
+        audit_dir = os.path.dirname(self.agent_status_audit_file)
+        if audit_dir:
+            os.makedirs(audit_dir, exist_ok=True)
+        with open(self.agent_status_audit_file, "a", encoding="utf-8") as audit_file:
+            audit_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    async def _send_agent_status(
+        self,
+        session: aiohttp.ClientSession,
+        *,
+        data_id: int,
+        session_id: str,
+        edit_type: str,
+    ) -> None:
+        state = _AGENT_EDIT_TO_STATUS[edit_type]
+        event = {"session": {"session_id": session_id}, "agent_status": {"state": state}}
+        url = urljoin(self.model.base_url, "agent-status")
+        headers = dict(getattr(self.model, "headers", {"Content-Type": "application/json"}))
+        record = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "data_id": data_id,
+            "session_id": session_id,
+            "edit_type": edit_type,
+            "state": state,
+            "url": url,
+            "offload_wait_s": self.agent_offload_wait_s if edit_type == "offload" else 0.0,
+        }
+        started = time.perf_counter()
+        try:
+            async with session.post(url=url, json=event, headers=headers) as response:
+                http_status = response.status
+                try:
+                    payload = await response.json(content_type=None)
+                except Exception as error:
+                    raise RuntimeError(f"invalid /agent-status JSON response: {error}") from error
+            record["http_status"] = http_status
+            record["applied"] = payload.get("applied") if isinstance(payload, dict) else None
+            record["reason"] = payload.get("reason", "") if isinstance(payload, dict) else ""
+            if http_status < 200 or http_status >= 300:
+                raise RuntimeError(f"/agent-status returned HTTP {http_status}: {payload}")
+            if not isinstance(payload, dict) or payload.get("applied") is not True:
+                raise RuntimeError(f"/agent-status event was not applied: {payload}")
+            record["success"] = True
+        except Exception as error:
+            record["success"] = False
+            record["error"] = str(error)
+            raise RuntimeError(
+                f"agent-status failed data_id={data_id} session_id={session_id} "
+                f"edit={edit_type}: {error}"
+            ) from error
+        finally:
+            record["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 3)
+            self._write_agent_status_audit(record)
+        self.logger.info(
+            f"[agent-status] data_id={data_id} session_id={session_id} "
+            f"edit={edit_type} state={state} applied=true"
+        )
+        if edit_type == "offload" and self.agent_offload_wait_s > 0:
+            await asyncio.sleep(self.agent_offload_wait_s)
+
     async def do_request(
         self, data: dict, token_bucket: BoundedSemaphore, session: aiohttp.ClientSession
     ):
@@ -97,6 +168,69 @@ class GenInferencer(BaseApiInferencer, BaseLocalInferencer):
                 )
                 return
             data.pop("agent_hint", None)
+
+        if getattr(self, "skip_prefetch", False) and is_manage_req:
+            edits = ((raw_agent_hint.get("context_management") or {}).get("edits") or [])
+            if any(isinstance(edit, dict) and edit.get("type") == "prefetch" for edit in edits):
+                self.logger.info(
+                    f"[session-aware] skip prefetch manage_request for B0, "
+                    f"session_id={session_id} data_id={index}"
+                )
+                return
+
+        data.pop("sched_parent_id", None)
+        if getattr(self, "agent_header_mode", False) and is_manage_req:
+            edits = ((raw_agent_hint.get("context_management") or {}).get("edits") or [])
+            if not edits:
+                self.logger.info(
+                    f"[agent-status] skip empty lifecycle marker, "
+                    f"session_id={session_id} data_id={index}"
+                )
+                self._write_agent_status_audit(
+                    {
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "data_id": index,
+                        "session_id": session_id,
+                        "edit_type": "",
+                        "state": "noop",
+                        "noop": True,
+                        "success": True,
+                        "http_status": None,
+                        "applied": None,
+                        "reason": "empty_edits_noop",
+                        "elapsed_ms": 0.0,
+                    }
+                )
+                return
+            if len(edits) != 1 or not isinstance(edits[0], dict) or edits[0].get("type") not in _AGENT_EDIT_TO_STATUS:
+                error = f"unsupported KVC edits data_id={index}: {edits}"
+                self._write_agent_status_audit(
+                    {
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "data_id": index,
+                        "session_id": session_id,
+                        "edit_type": "unknown",
+                        "state": "error",
+                        "noop": False,
+                        "success": False,
+                        "http_status": None,
+                        "applied": False,
+                        "reason": "unsupported_edits",
+                        "error": error,
+                        "elapsed_ms": 0.0,
+                    }
+                )
+                raise ValueError(error)
+            edit_type = edits[0].get("type")
+            if not session_id:
+                raise ValueError(f"agent-status requires session_id, data_id={index}")
+            await self._send_agent_status(
+                session,
+                data_id=index,
+                session_id=session_id,
+                edit_type=edit_type,
+            )
+            return
 
         uid = str(uuid.uuid4()).replace("-", "")
         output = RequestOutput(self.perf_mode)
@@ -216,7 +350,7 @@ class GenInferencer(BaseApiInferencer, BaseLocalInferencer):
         # Columns that are either consumed into the prompt or are control
         # fields and therefore must NOT be forwarded into the request body.
         _consumed = {"prompt", "question", "data_abbr", "index", "max_out_len",
-                     "gold", "timestamp", "session_id", "answer"}
+                     "gold", "timestamp", "session_id", "answer", "sched_parent_id"}
         if raw_test is not None and len(raw_test) > 0:
             for col in raw_test.column_names:
                 if col in _consumed:

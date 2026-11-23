@@ -65,6 +65,10 @@ class BaseApiInferencer(BaseInferencer):
         session_aware: Optional[bool] = False,
         session_concurrency: Optional[int] = None,
         pass_agent_hint: Optional[bool] = False,
+        skip_prefetch: Optional[bool] = False,
+        agent_header_mode: Optional[bool] = False,
+        agent_offload_wait_s: Optional[float] = 0.0,
+        agent_status_audit_file: Optional[str] = "",
         **kwargs,
     ) -> None:
         # Base class handles batch_size validation, model construction, output_handler initialization, etc.
@@ -93,6 +97,10 @@ class BaseApiInferencer(BaseInferencer):
                 f"session_concurrency must be > 0 when session_aware=True, got {self.session_concurrency}",
             )
         self.pass_agent_hint = bool(pass_agent_hint)
+        self.skip_prefetch = bool(skip_prefetch)
+        self.agent_header_mode = bool(agent_header_mode)
+        self.agent_offload_wait_s = max(0.0, float(agent_offload_wait_s or 0.0))
+        self.agent_status_audit_file = agent_status_audit_file or ""
 
     def set_config(self, config: ApiInferencerConfig):
         for key, value in config.to_dict().items():
@@ -366,8 +374,8 @@ class BaseApiInferencer(BaseInferencer):
             arrivals to it; a brand-new session_worker task is submitted (and
             appended to ``session_tasks``) to process the remaining data.
             """
-            saw_end = False
             split = False  # whether create a new task (and a new queue) for the remain datas of current queue.
+            split_after_request = False
             async with session_sem:
                 self.logger.info(f"[session-aware] session {psid} acquired exec slot, work queue len is {q.qsize()}")
                 while not stop_event.is_set():
@@ -375,21 +383,28 @@ class BaseApiInferencer(BaseInferencer):
                     if data is None:  # sentinel from dispatcher (only at end of all data)
                         break
 
-                    # Offload split: hand the rest of this session to a new task.
+                    # Offload split: hand the rest of this session to a new task
+                    # after this offload request has completed.
                     if self._task_queue_has_real_data(q):
                         if self._data_has_offload_edit(data):
                             self.logger.info(
                                 f"[session-aware] session {psid} detect offload edit."
                             )
                             split = True
-                            create_new_task(psid, q)
+                            split_after_request = True
                         elif self._data_is_end(data):
                             self.logger.info(
                                 f"[session-aware] session {psid} detect end data. "
                             )
                             split = True
-                            create_new_task(psid, q)
-                            break
+                            if self.agent_header_mode:
+                                # Let GenInferencer record an explicit no-op audit
+                                # for the empty end management record. Legacy body
+                                # scheduling keeps the original early-skip behavior.
+                                split_after_request = True
+                            else:
+                                create_new_task(psid, q)
+                                break
 
                     # Optional global RPS limiter (shared across sessions)
                     if token_bucket is not None:
@@ -420,6 +435,8 @@ class BaseApiInferencer(BaseInferencer):
                             f"[session-aware] session {psid} interrupted after offload, "
                             f"submitting new task for remaining data"
                         )
+                        if split_after_request:
+                            create_new_task(psid, q)
                         break
 
                 # session finished.
@@ -464,7 +481,12 @@ class BaseApiInferencer(BaseInferencer):
                 if data is None:
                     break
                 agent_hint = data.get("agent_hint") or {}
-                psid = agent_hint.get("parent_session_id") or data.get("parent_session_id", "") or "default"
+                psid = (
+                    data.get("sched_parent_id")
+                    or agent_hint.get("parent_session_id")
+                    or data.get("parent_session_id", "")
+                    or "default"
+                )
                 if psid not in session_queues:
                     q = asyncio.Queue()
                     session_queues[psid] = q
